@@ -1,0 +1,7 @@
+{
+  "python.defaultInterpreterPath": "D:\\project\\learn-claude-code\\.venv\\Scripts\\python.exe",
+  "python.terminal.activateEnvironment": true,
+  "python.envFile": "${workspaceFolder}/.env",
+  "python.terminal.useEnvFile": true,
+  "python.terminal.executeInFileDir": true
+}

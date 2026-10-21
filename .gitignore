@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+!.env.example
+workspace/
+runs/
+
+/test/
+
+node_modules/
+
+*.log
