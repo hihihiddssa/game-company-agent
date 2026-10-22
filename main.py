@@ -9,7 +9,28 @@ Lead 和每个队友都调用模型，不包含固定业务模板或 DemoExecuto
 保留原版 Task 文件、MessageBus、持久队友、Hooks、计划审批、可选 worktree
 以及 Windows msvcrt 文件锁和终端输入支持。团队扩展处标记为 [Team Framework]。
 原项目 MIT 授权见 LICENSE。
+
+阅读顺序（先看主流程，再看细节）：
+    main() → agent_loop() → execute_tool() → TOOL_HANDLERS → run_*()
+    需要了解子 Agent 时，再看 TeammateRuntime.work() 和 spawn_teammate_thread()。
+
+文件导航（搜索编号；VS Code 可折叠 # region）：
+    01 导入与平台兼容        02 模型客户端          03 上下文压缩
+    04 提示词、常用设置与共享状态    05 TaskStore 任务板    06 Worktree 与任务目录
+    07 系统提示词            08 MessageBus 与协议  09 空闲任务发现
+    10 工具具体实现          11 子 Agent 生命周期  12 工具定义、映射与分发
+    13 Hooks 与权限检查      14 终端输入输出        15 Lead Agent Loop
+    16 main 启动入口
+
+三个工具对象的区别：
+    BASE_TOOLS / TASK_TOOLS / TEAM_TOOLS / DELIVERY_TOOLS：分组的工具定义。
+    TOOLS：以上定义合并后的 Lead 工具总集合，传给模型。
+    TOOL_HANDLERS：工具名到 Python 函数的映射，供执行器调用。
+    TEAMMATE_TOOLS：子 Agent 的工具定义集合，不与 Lead 集合重复拼接。
 """
+
+# region 01 导入与平台兼容
+# 依赖只在这里导入；Windows 文件锁和终端输入保留平台分支。
 
 import argparse
 import copy
@@ -44,14 +65,19 @@ import urllib.request
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-# -- DeepSeek API client --
+# endregion
+
+
+# region 02 模型客户端
+# 封装 DeepSeek 兼容接口与使用量统计；不在这里编排任务。
+
 # 直接复用原版 SDK 的消息格式，下面熟悉的 agent_loop 和队友 work() 保持原样。
 
 class DeepSeekClient:
     """复用原 Anthropic SDK 的消息格式，让原来的 Agent Loop 保持不变。
 
     请求实际发给 DeepSeek，不使用 Anthropic 的模型或余额。
-    Lead 和三个队友共用此客户端，各自维护独立的 messages 历史。
+    Lead 和动态创建的队友共用此客户端，各自维护独立的 messages 历史。
     """
 
     def __init__(self, api_key: str, timeout: float = 120):
@@ -65,6 +91,10 @@ class DeepSeekClient:
             timeout=timeout, max_retries=0,
         )
         self.messages = self
+        # 多个队友共享客户端，用锁保护统计；只记录用量，不记录密钥或消息正文。
+        self.usage_lock = threading.Lock()
+        self.usage_totals = {"requests": 0, "input_tokens": 0, "output_tokens": 0,
+                             "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
 
     def create(self, **kwargs):
         """原封不动传递 system、messages 和 tools，仅固定关闭深度思考。
@@ -73,8 +103,26 @@ class DeepSeekClient:
         不额外排队限速；超时或余额不足直接报告，避免后台反复请求。
         """
         kwargs["thinking"] = {"type": "disabled"}
+        started = time.monotonic()
         try:
-            return self._client.messages.create(**kwargs)
+            response = self._client.messages.create(**kwargs)
+            usage = response.usage
+            values = {key: int(getattr(usage, key, 0) or 0) for key in self.usage_totals if key != "requests"}
+            with self.usage_lock:
+                self.usage_totals["requests"] += 1
+                for key, value in values.items():
+                    self.usage_totals[key] += value
+                request_number = self.usage_totals["requests"]
+            agent = threading.current_thread().name
+            print(f"[api] #{request_number} {agent}: {time.monotonic() - started:.1f}s "
+                  f"input={values['input_tokens']} cached={values['cache_read_input_tokens']} "
+                  f"output={values['output_tokens']}", flush=True)
+            # 4096 是单次输出上限，不是实际消耗。截断的工具参数不能继续执行，
+            # 否则可能表现为 write_file({})，让模型反复修复无效调用。
+            if response.stop_reason == "max_tokens":
+                raise RuntimeError("模型回复达到输出上限，可能包含不完整工具参数；已停止本轮。"
+                                   "请缩小单次输出或提高 AGENT_MAX_OUTPUT_TOKENS。")
+            return response
         except Exception as exc:
             raise RuntimeError(str(exc).replace(self._api_key, "[REDACTED]")) from None
 
@@ -95,11 +143,15 @@ class DeepSeekClient:
             raise RuntimeError("DeepSeek model is not available: " + model)
         return {"name": model}
 
+# endregion
 
-# -- Context Compression / 上下文压缩 --
+
+# region 03 上下文压缩
+# 每个 Agent 在请求模型前整理自己的历史，任务板和邮箱不参与摘要存储。
+
 # 学习入口：先读 prepare()，再看它调用的几个小方法。
 # 参考 learn-claude-code s08 的“旧工具结果缩短 + 历史摘要”思路，
-# 这里将实现留在同一个 main.py 中，并接入原来的 Lead / Teammate 循环。
+# 压缩实现与主循环放在同一个文件中，直接接入 Lead / Teammate 循环。
 
 class ContextManager:
     """管理一次模型请求携带的历史；不管理任务状态，也不是持久 Memory。
@@ -341,7 +393,7 @@ class ContextManager:
 
         #先复制一份 messages，避免直接修改原始数据 先在副本上尝试压缩
         candidate = copy.deepcopy(messages)
-        
+
         #第一层压缩：缩短旧工具输出
         self._micro_compact(candidate)
         mode = "micro"
@@ -376,136 +428,87 @@ class ContextManager:
 
 
 # [Team Framework] 导入模块不会加载凭据或请求模型；CLI 启动时再配置。
+
+# endregion
+
+
+# region 04 提示词、常用设置与共享状态
+# 直接编辑本节的提示词与常用设置；TEAM_MEMBERS 是动态注册表，启动时为空。
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 WORKDIR = Path(os.getenv("TEAM_WORKDIR") or os.getenv("GAME_STUDIO_WORKDIR") or PROJECT_ROOT / "workspace").resolve()
 client = None
 MODEL = ""
 # 共享配置，不共享摘要；.env 加载后 main 会重新创建配置对象。
 context_manager = ContextManager()
-# -- Team Configuration / 团队配置 --
-# 框架只负责协作机制；成员职责和业务交付规则从 JSON 读取。
-# 未提供配置文件时使用这个通用团队；游戏团队只是 examples/ 下的一个示例。
-DEFAULT_TEAM_CONFIG = {
-    "name": "Multi-Agent Team",
-    "lead_prompt": "你是通用多 Agent 团队的 Lead。理解用户目标，组织协作，使用中文沟通，诚实报告证据和限制。",
-    "members": [
-        {"name": "planner", "role": "planner", "instructions": "分析需求、拆解方案、明确依赖与验收标准，将方案写入 docs/。"},
-        {"name": "builder", "role": "builder", "instructions": "按方案完成实际工作，将产物保存到工作区，提供使用或运行说明。"},
-        {"name": "reviewer", "role": "reviewer", "instructions": "独立检查产物与证据，报告问题和建议；未实际执行的检查必须说明。"},
-    ],
-    "delivery": {"required_members": [], "required_files": [], "report_path": None, "report_owner": None},
-}
-TEAM_CONFIG = copy.deepcopy(DEFAULT_TEAM_CONFIG)
-TEAM_MEMBERS = {member["name"]: member for member in TEAM_CONFIG["members"]}
+
+# 想改模型行为，直接编辑下面的提示词和设置；不再读取团队配置 JSON。
+# 是否创建子 Agent、创建多少、名字与职责，仍由 Lead 在运行时决定。
+TEAM_NAME = "Multi-Agent Team Framework"
+
+# Lead 如何理解目标、决定是否分工，以及控制任务范围。
+LEAD_PROMPT = (
+    '你是通用任务的 Lead，使用中文沟通。'
+    '先判断自己能否直接完成；'
+    '简单任务直接使用工具完成，不为走流程创建子 Agent、任务板或额外文档。'
+    '只有分工、并行或独立复核确有价值时才创建子 Agent；'
+    '自行决定是否创建、人数、名字、职责及任务说明，不预设规划/开发/测试岗位。'
+    '遵守用户目标、范围和指定目录，只做最小必要工作。'
+    '规划简短，普通任务不额外申请计划审批。'
+    '不自行增加失败演示、测试框架、新依赖或额外产物。'
+    '文件未改且检查通过时不重复运行相同检查。'
+    '同类问题最多尝试修复两次，仍失败则报告阻塞。'
+    '只在有新结果或阻塞时协调，诚实报告证据和限制；'
+    '使用子 Agent 后在任务结束时关闭它们。'
+)
+
+# 所有子 Agent 的通用约束；具体职责由 spawn_teammate 的 role/prompt 给出。
+TEAMMATE_PROMPT = (
+    '只完成 Lead 交给你的最小任务，遵守用户范围和指定目录。'
+    '职责和验收以本次任务说明为准。'
+    '不扩写计划或新增未要求的文档、测试框架和依赖。'
+    '检查通过且文件未变时不重复执行。'
+    '读取工具返回的 returncode/stdout/stderr，不追加退出码探测；'
+    '中文 Python 脚本可用 python -X utf8。'
+    '只有 [Plan required] 才提交计划审批。'
+    '被分配的任务完成后调用 complete_task，简短报告结果或阻塞，不重复发送完成通知。'
+)
+
+# 子 Agent 的工作区工具权限上限；创建时 tools 参数只能在此基础上缩小。
+# [] 表示只允许任务、消息和计划工具；Lead 的工具不受这个列表限制。
+TEAMMATE_ALLOWED_TOOLS = ["bash", "read_file", "write_file", "edit_file", "glob"]
+
+# 可选交付规则。默认不要求固定产物或质量报告，也不要求创建子 Agent。
+# 示例：DELIVERY_REQUIRED_FILES = ["game/index.html"]
+#       QUALITY_REPORT_PATH = "reports/qa.json"
+DELIVERY_REQUIRED_FILES = []
+QUALITY_REPORT_PATH = None
+
+# 这是运行时注册表，不是预设名单。仅成功创建的子 Agent 才在这里登记。
+# 成员退出后保留元数据，便于核对已完成任务的归属；重启程序后从空表开始。
+TEAM_MEMBERS = {}
 MAX_OUTPUT_TOKENS = 4096  # 真正的模型回复上限，同时用于压缩预算，避免两处数字不一致。
 
 
-def validate_team_config(config):
-    """严格校验 JSON，避免拼错字段后被悄悄忽略。
+def validate_workspace_tools(tools):
+    """校验文件/Shell 工具名；不修改调用者传入的列表。
 
-    name 是成员身份，也是 Task.assignee / MessageBus 地址。
-    role 是职责标签，可以多个成员共用，例如 frontend/backend 都是 developer。
-    tools 只配置文件/Shell 工具；任务、消息和审批工具始终保留，保证协作可用。
+    TEAMMATE_ALLOWED_TOOLS 给出子 Agent 的权限上限，spawn_teammate 可以进一步缩小权限。
+    消息、任务、审批工具由框架保留，不属于这个列表。
     """
-    if not isinstance(config, dict) or set(config) - {"name", "lead_prompt", "members", "delivery"}:
-        raise ValueError("团队配置必须是对象，字段为 name/lead_prompt/members/delivery")
-    result = copy.deepcopy(config)
-    for field in ("name", "lead_prompt"):
-        if not isinstance(result.get(field), str) or not result[field].strip():
-            raise ValueError(f"团队 {field} 必须是非空字符串")
-    members = result.get("members")
-    if not isinstance(members, list) or not 1 <= len(members) <= 32:
-        raise ValueError("members 应包含 1～32 名成员")
-    names = set()
-    for member in members:
-        if not isinstance(member, dict) or set(member) - {"name", "role", "instructions", "tools"}:
-            raise ValueError("成员字段为 name/role/instructions/tools")
-        name = member.get("name")
-        if not isinstance(name, str) or not is_valid_agent_name(name) or name.lower() in RESERVED_TEAMMATE_NAMES:
-            raise ValueError(f"无效或保留的成员名：{name!r}")
-        if name.casefold() in names:
-            raise ValueError(f"成员名称重复（不区分大小写）：{name}")
-        names.add(name.casefold())
-        for field in ("role", "instructions"):
-            if not isinstance(member.get(field), str) or not member[field].strip():
-                raise ValueError(f"成员 {name} 的 {field} 必须是非空字符串")
-        allowed = member.setdefault("tools", ["bash", "read_file", "write_file", "edit_file", "glob"])
-        if not isinstance(allowed, list) or any(not isinstance(t, str) or t not in {"bash", "read_file", "write_file", "edit_file", "glob"} for t in allowed):
-            raise ValueError(f"成员 {name} 的 tools 只能包含 bash/read_file/write_file/edit_file/glob")
-        if len(set(allowed)) != len(allowed):
-            raise ValueError(f"成员 {name} 的 tools 不能重复")
-    delivery = result.setdefault("delivery", {})
-    if not isinstance(delivery, dict) or set(delivery) - {"required_members", "required_files", "report_path", "report_owner"}:
-        raise ValueError("delivery 字段为 required_members/required_files/report_path/report_owner")
-    actual_names = {m["name"] for m in members}
-    required = delivery.setdefault("required_members", [])
-    if not isinstance(required, list) or any(not isinstance(n, str) or n not in actual_names for n in required):
-        raise ValueError("required_members 必须引用配置中的成员 name")
-    paths = delivery.setdefault("required_files", [])
-    if not isinstance(paths, list):
-        raise ValueError("required_files 必须是相对路径列表")
-    def relative_path(path):
-        if not isinstance(path, str) or not path.strip():
-            return False
-        normalized = path.replace("\\", "/")
-        return not (normalized.startswith("/") or ":" in normalized or ".." in normalized.split("/"))
-    if any(not relative_path(path) for path in paths):
-        raise ValueError("required_files 必须是工作区内的相对文件路径")
-    report = delivery.setdefault("report_path", None)
-    reviewer = delivery.setdefault("report_owner", None)
-    if report is not None and (not relative_path(report) or not isinstance(reviewer, str) or reviewer not in actual_names):
-        raise ValueError("启用 report_path 时必须设置有效的相对路径和 report_owner 成员")
-    if report is None and reviewer is not None:
-        raise ValueError("report_owner 需要与 report_path 一起设置")
-    return result
+    allowed = {"bash", "read_file", "write_file", "edit_file", "glob"}
+    if not isinstance(tools, list) or any(not isinstance(t, str) or t not in allowed for t in tools):
+        raise ValueError("工具只能包含 bash/read_file/write_file/edit_file/glob")
+    if len(set(tools)) != len(tools):
+        raise ValueError("工具列表不能重复")
+    return list(tools)
 
 
-def load_team_config(path=None):
-    """只读配置，不创建线程。显式指定的路径不存在时直接报错。
-
-    CLI --team-config 优先，其次 TEAM_CONFIG 环境变量，再用项目 team.json。
-    默认 team.json 不存在时才回退到内置通用配置。
-    """
-    configured = path or os.getenv("TEAM_CONFIG")
-    config_path = Path(configured) if configured else PROJECT_ROOT / "team.json"
-    if not config_path.is_absolute():
-        config_path = PROJECT_ROOT / config_path
-    if not configured and not config_path.exists():
-        return validate_team_config(DEFAULT_TEAM_CONFIG)
-    return validate_team_config(json.loads(config_path.read_text(encoding="utf-8-sig")))
+# endregion
 
 
-def configure_team(config):
-    """同步成员表、Lead 提示词和工具 Schema，避免模型看到旧角色枚举。
-
-    只允许在开工之前切换，运行中的 Task.owner 和队友身份不能被配置热替换。
-    本函数在 main 中加载 .env / 工作区后调用；这里的函数名在调用时已全部定义。
-    """
-    global TEAM_CONFIG, TEAM_MEMBERS, PROMPT_SECTIONS, SYSTEM
-    checked = validate_team_config(config)
-    with team_lock:
-        if active_teammates:
-            raise ValueError("团队运行中不能切换配置，请先关闭队友")
-        TEAM_CONFIG = checked
-        TEAM_MEMBERS = {m["name"]: m for m in checked["members"]}
-        for tool in TASK_TOOLS:
-            if tool["name"] == "assign_task":
-                tool["input_schema"]["properties"]["assignee"]["enum"] = list(TEAM_MEMBERS)
-        PROMPT_SECTIONS = build_prompt_sections(checked)
-        SYSTEM = "\n\n".join(PROMPT_SECTIONS.values())
-
-
-def teammate_tools(name):
-    """决定成员能向模型声明、也能实际执行哪些工具。
-
-    配置 tools=[] 表示不开放工作区工具；仍能认领任务、沟通和提交计划。
-    这是应用层工具权限；允许 bash 就能通过命令访问文件，不是 OS 沙箱。
-    """
-    workspace = set(TEAM_MEMBERS[name].get("tools", [t["name"] for t in BASE_TOOLS]))
-    coordination = {"send_message", "submit_plan", "list_tasks", "claim_task", "complete_task"}
-    return [tool for tool in TEAMMATE_TOOLS if tool["name"] in workspace | coordination]
-
-# -- Task System --
+# region 05 TaskStore 任务板
+# 任务数据、文件锁、依赖、认领和完成；所有 Agent 使用同一份事实来源。
 
 TASKS_DIR = WORKDIR / ".tasks"
 TASKS_ROOT = TASKS_DIR.resolve()
@@ -546,7 +549,7 @@ def task_store_lock():
         if depth == 0:
             # 创建保存task的地方 之后保存eg: task_XXX1.json task_XXX2.json ...
             TASKS_DIR.mkdir(parents=True, exist_ok=True)
-            
+
             handle = TASK_LOCK_PATH.open("a+b")
             try:
                 if os.name == "nt":
@@ -625,7 +628,7 @@ class Task:#创建的“任务”的数据结构
     subject: str  # "开发贪吃蛇游戏"
     description: str  # "任务的详细描述"
     status: str  # pending | in_progress | completed
-    owner: str | None  # "agent" | 配置中的成员名 | None
+    owner: str | None  # "agent" | 动态创建的成员名 | None
     blockedBy: list[str]  # 依赖的任务ID列表，当前任务在这些任务完成之前无法开始
     worktree: str | None = None  # 绑定的工作树名称，任务在特定的工作树中执行
     assignee: str | None = None  # [Team Framework] Lead 派发后，只有指定队友能领取。
@@ -869,8 +872,11 @@ def complete_task(task_id: str, owner: str = "agent") -> str:
         print(f"  [unblocked] {', '.join(unblocked)}")
     return msg
 
+# endregion
 
-# -- Task-bound Worktrees --
+
+# region 06 Worktree 与任务目录
+# 可选 Git 工作树以及任务执行目录绑定；普通任务也可以只用 workspace。
 
 WORKTREES_DIR = WORKDIR / ".worktrees"
 WORKTREES_ROOT = WORKTREES_DIR.resolve()
@@ -1417,8 +1423,11 @@ def remove_worktree(name: str, discard_changes: bool = False) -> str:
     print(f"  [worktree] removed: {name}; branch retained")
     return f"Worktree '{name}' removed; branch '{_worktree_branch(name)}' retained"
 
+# endregion
 
-# -- System Prompt --
+
+# region 07 系统提示词
+# 把本文件的提示词、常用设置和协作协议组合起来，供模型请求使用。
 
 ENVIRONMENT_PROMPT = (
     "Windows: the bash tool runs through cmd.exe; use cmd.exe syntax, not Unix "
@@ -1427,292 +1436,56 @@ ENVIRONMENT_PROMPT = (
     else "Unix-like: the bash tool runs the system shell"
 )
 # [Team Framework] 分工和任务图由模型决定，Python 不预建固定开发流水线。
-def build_prompt_sections(config):
-    """框架提示词描述协作协议，业务职责来自 JSON，不再固定为游戏开发。
-
-    每次切换配置重建提示词，保证角色清单、交付政策与真实执行逻辑一致。
-    """
-    members = [{"name": m["name"], "role": m["role"], "instructions": m["instructions"],
-                "tools": m.get("tools", ["bash", "read_file", "write_file", "edit_file", "glob"])}
-               for m in config["members"]]
+def build_prompt_sections():
+    """声明协作协议；是否使用子 Agent、名字与职责均由 Lead 决定。"""
     return {
-        "identity": config["lead_prompt"] + f"\n团队：{config['name']}。环境：{ENVIRONMENT_PROMPT}。",
+        "identity": LEAD_PROMPT + f"\n团队：{TEAM_NAME}。环境：{ENVIRONMENT_PROMPT}。",
         "tasks": (
-            "先理解目标与验收标准。只有 Lead 创建任务和维护依赖图。先 create_task 得到真实 ID，"
-            "再 update_task 连边，最后 assign_task 派发。不要在同批调用里引用尚未返回的 ID。"
-            "已派发任务不能修改依赖，需要变更时创建新任务。只有前置任务完成后才开始后续任务。"
+            "简单任务可以由你直接使用文件/Shell 工具完成，不必创建任务板。"
+            "需要任务板时，只有 Lead 创建任务和维护依赖图。先 create_task 得到真实 ID，"
+            "再 update_task 连边。你自行执行的任务用 claim_task/complete_task；"
+            "委派任务先 assign_task 到你选定的子 Agent 名字，再 spawn_teammate(task_id=该ID)。"
+            "名字无需预先登记，但派发和创建必须使用相同拼写；spawn 会自动认领该任务。"
+            "前置任务未完成时，先创建成员但省略 task_id，成员会在空闲时自动领取就绪任务。"
+            "同一阶段独立工具可以批量调用，不要在同批中引用尚未返回的 ID。"
+            "已派发任务不能修改依赖；只能由所属成员认领，必须等待前置任务完成。"
         ),
         "teams": (
-            "根据用户需求按需启动已配置的成员，不要求每次启动所有成员。"
-            "spawn_teammate 的 name 与 role 必须匹配以下配置，两者可以不同；"
-            "每个 name 最多一个持久队友。成员清单：" + json.dumps(members, ensure_ascii=False) +
-            "。按职责和路径避免并行写入冲突。spawn 后不要轮询等待；安排好后结束当前轮次，"
-            "运行时会通过收件箱事件唤醒你。区分 result、idle_notification、error。"
-            "收到问题后根据配置安排修复和复核，不得把 completed 等同于检查通过。"
-            "计划审批和关闭使用既有协议；结束后 request_shutdown 关闭所有队友。"
-            "worktree 是可选工作目录，不是沙箱。"
+            "没有预设成员名单或固定岗位。自行判断是否需要子 Agent；不需要就直接完成。"
+            "需要时调用 spawn_teammate，自行给出 name、role 和具体 prompt，包括范围与验收。"
+            "名字使用1～64位英文字母、数字、下划线或短横线，不能用 lead/agent，同名成员不能同时启动。"
+            "已退出成员可用原名字和原职责重启以继续中断的任务；新职责使用新名字。"
+            "role 是自由职责描述，不是预定义枚举。TEAMMATE_ALLOWED_TOOLS 是子 Agent 工具权限上限："
+            + json.dumps(TEAMMATE_ALLOWED_TOOLS, ensure_ascii=False) +
+            "；可通过 spawn 的 tools 参数缩小权限。按职责和路径避免并行写入冲突。"
+            "用 list_teammates 查询实际成员，send_message 进行必要协调。"
+            "spawn 后不要轮询；安排好后结束本轮，由邮箱事件唤醒。"
+            "区分 result、idle_notification、error；不得把 completed 等同于检查通过。"
+            "计划审批和关闭沿用原协议，任务结束后关闭使用过的成员。worktree 可选，不是沙箱。"
         ),
         "delivery": (
-            "产物必须写入工作区，提供实际交付路径与使用说明。具体任务内容遵循用户需求和成员职责。"
-            "交付政策：" + json.dumps(config["delivery"], ensure_ascii=False) +
-            "。全部任务完成后调用 accept_delivery，artifacts 填实际文件的工作区相对路径列表。"
-            "若配置启用了 report_path，由 report_owner 实际检查后写入报告，格式为"
-            '{"task_id":"复核任务ID","passed":true,"issues":[],"checks":'
+            "产物写入工作区，提供路径与使用说明。交付政策："
+            + json.dumps({"required_files": DELIVERY_REQUIRED_FILES, "report_path": QUALITY_REPORT_PATH}, ensure_ascii=False) +
+            "。有文件产物时用 accept_delivery(artifacts=工作区相对路径列表) 验收。"
+            "没有创建任务或子 Agent 也可以交付；若创建了任务，必须全部完成。纯问答直接回复。"
+            "设置 QUALITY_REPORT_PATH 时，报告须引用实际执行检查者拥有且完成的任务；"
+            "执行者可以是 Lead（任务 owner=agent），也可以是动态创建的子 Agent。格式为"
+            '{"task_id":"实际检查任务ID","passed":true,"issues":[],"checks":'
             '[{"name":"检查名","command":"实际命令","returncode":0,"output":"结果"}]}。'
-            "报告必须诚实，未执行的检查不能声称通过。验收检查文件和报告结构，不替代真实体验或专业审查。"
+            "未执行的检查不能声称通过。文件和报告结构检查不替代实际验证。"
         ),
         "workspace": f"Working directory: {WORKDIR}",
     }
 
 
-PROMPT_SECTIONS = build_prompt_sections(TEAM_CONFIG)
+PROMPT_SECTIONS = build_prompt_sections()
 SYSTEM = "\n\n".join(PROMPT_SECTIONS.values())
 
-
-# -- Base Tools --
-
-
-def safe_path(p: str, cwd: Path | None = None) -> Path:
-    base = (cwd or WORKDIR).resolve()
-    path = (base / p).resolve()
-    if not path.is_relative_to(base):
-        raise ValueError(f"Path escapes workspace: {p}")
-    return path
+# endregion
 
 
-def run_bash(command: str, cwd: Path | None = None, timeout: float = 120) -> str:
-    """执行非交互 Shell 命令，返回输出；超时结束整个子进程树。
-
-    command 是模型提供的命令；cwd 默认 WORKDIR；timeout 默认 120 秒。
-    模型仍通过原来的 bash 工具调用此函数，Agent Loop 的协议不变。
-    stdin 使用 DEVNULL，子程序不能偷偷读取用户正在给 Lead 输入的文字。
-    npm 默认不自动安装缺失的包：缺依赖时返回错误；模型若决定安装须明确使用 --yes。
-    每等待 15 秒打印进度，避免命令正在执行却没有任何可见状态。
-    Windows 超时时使用 taskkill /T 结束整棵命令树，不能只杀 cmd.exe：
-    npm 等子进程可能继续持有输出管道，让 communicate 再次无限等待。
-    """
-    if timeout <= 0:
-        return "Error: command timeout must be positive"
-    started = time.monotonic()
-    tool_env = dict(os.environ)
-    tool_env.setdefault("npm_config_yes", "false")
-    print(f"  [shell] start (limit {timeout:g}s): {command[:160]}", flush=True)
-    process = None
-    try:
-        process = subprocess.Popen(
-            command,
-            shell=True,
-            cwd=cwd or WORKDIR,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            errors="replace",
-            env=tool_env,
-            start_new_session=(os.name != "nt"),
-        )
-        deadline = started + timeout
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise subprocess.TimeoutExpired(command, timeout)
-            try:
-                # 多次 communicate 会继续收集同一进程的输出，不会重新执行命令。
-                stdout, stderr = process.communicate(timeout=min(15, remaining))
-                break
-            except subprocess.TimeoutExpired:
-                if time.monotonic() >= deadline:
-                    raise
-                print(f"  [shell] still running: {time.monotonic() - started:.0f}s", flush=True)
-        output = (stdout + stderr).strip()
-        output = output[:50000] if output else "(no output)"
-        print(f"  [shell] finished: exit={process.returncode}, {time.monotonic() - started:.1f}s", flush=True)
-        if process.returncode:
-            return f"Error: command exited with status {process.returncode}\n{output}"
-        return output
-    except subprocess.TimeoutExpired:
-        # 显式清理后，再有界收尾；不使用 subprocess.run 的无界 Windows 管道等待。
-        if process is not None:
-            try:
-                if os.name == "nt":
-                    subprocess.run(
-                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=10,
-                    )
-                else:
-                    import signal
-                    os.killpg(process.pid, signal.SIGKILL)
-            except (OSError, subprocess.TimeoutExpired):
-                # 父进程可能已经结束；仍尝试结束当前句柄，不再无限等待输出。
-                if process.poll() is None:
-                    process.kill()
-            try:
-                process.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                print("  [shell] a descendant still holds the output pipe; stopped waiting", flush=True)
-        print(f"  [shell] timeout after {timeout:g}s; process-tree cleanup attempted", flush=True)
-        return (
-            f"Error: Timeout ({timeout:g}s). Process-tree cleanup attempted. "
-            "Commands must be non-interactive. Check missing dependencies or report a testing blocker."
-        )
-    except OSError as exc:
-        return f"Error: {type(exc).__name__}: {exc}"
-
-
-def run_read(path: str, limit: int | None = None, cwd: Path | None = None) -> str:
-    try:
-        lines = safe_path(path, cwd).read_text(encoding="utf-8").splitlines()
-        if limit and limit < len(lines):
-            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
-
-
-def run_write(path: str, content: str, cwd: Path | None = None) -> str:
-    try:
-        fp = safe_path(path, cwd)
-        fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content, encoding="utf-8")
-        return f"Wrote {len(content)} bytes to {path}"
-    except Exception as e:
-        return f"Error: {e}"
-
-
-def run_edit(path: str, old_text: str, new_text: str, cwd: Path | None = None) -> str:
-    try:
-        target = safe_path(path, cwd)
-        content = target.read_text(encoding="utf-8")
-        count = content.count(old_text)
-        if count != 1:
-            return f"Error: Expected 1 occurrence, found {count}"
-        target.write_text(content.replace(old_text, new_text), encoding="utf-8")
-        return f"Edited {path}"
-    except Exception as exc:
-        return f"Error: {exc}"
-
-
-def run_glob(pattern: str, cwd: Path | None = None) -> str:
-    try:
-        base = (cwd or WORKDIR).resolve()
-        matches = [
-            str(path.relative_to(base))
-            for path in sorted(base.glob(pattern))
-            if path.resolve().is_relative_to(base)
-        ]
-        shown = matches[:200]
-        if len(matches) > 200:
-            shown.append("... (more matches omitted; narrow the pattern)")
-        return "\n".join(shown) or "No files found"
-    except Exception as exc:
-        return f"Error: {exc}"
-
-
-def _agent_cwd() -> tuple[Path | None, str | None]:
-    try:
-        return assignment_cwd("agent"), None
-    except (FileNotFoundError, ValueError) as exc:
-        return None, f"Error: Invalid task assignment: {exc}"
-
-
-def run_agent_bash(command: str) -> str:
-    cwd, error = _agent_cwd()
-    return error or run_bash(command, cwd)
-
-
-def run_agent_read(path: str, limit: int | None = None) -> str:
-    cwd, error = _agent_cwd()
-    return error or run_read(path, limit, cwd)
-
-
-def run_agent_write(path: str, content: str) -> str:
-    cwd, error = _agent_cwd()
-    return error or run_write(path, content, cwd)
-
-
-def run_agent_edit(path: str, old_text: str, new_text: str) -> str:
-    cwd, error = _agent_cwd()
-    return error or run_edit(path, old_text, new_text, cwd)
-
-
-def run_agent_glob(pattern: str) -> str:
-    cwd, error = _agent_cwd()
-    return error or run_glob(pattern, cwd)
-
-
-# -- Task Tools --
-
-
-def run_create_task(subject: str, description: str = "") -> str:
-    task = create_task(subject, description)
-    print(f"  \033[34m[create] {task.subject}\033[0m")
-    return f"Created {task.id}: {task.subject}"
-
-
-def run_update_task(task_id: str, addBlockedBy: list[str]) -> str:
-    try:
-        task = update_task(task_id, addBlockedBy)
-    except ValueError as exc:
-        return f"Error: {exc}"
-    except FileNotFoundError:
-        return f"Error: Task {task_id} not found"
-    dependencies = ", ".join(task.blockedBy) or "(none)"
-    print(f"  \033[34m[update] {task.subject} blockedBy: {dependencies}\033[0m")
-    return f"Updated {task.id} blockedBy: {dependencies}"
-
-
-def run_list_tasks() -> str:
-    tasks = list_tasks()
-    if not tasks:
-        return "No tasks. Use create_task to add some."
-    lines = []
-    for t in tasks:
-        icon = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}.get(
-            t.status, "[?]"
-        )
-        deps = f" (blockedBy: {', '.join(t.blockedBy)})" if t.blockedBy else ""
-        owner = f" [{t.owner}]" if t.owner else ""
-        worktree = f" (worktree: {t.worktree})" if t.worktree else ""
-        worktree += f" (assignee: {t.assignee})" if t.assignee else " (not dispatched)"
-        lines.append(
-            f"  {icon} {t.id}: {t.subject} [{t.status}]{owner}{deps}{worktree}"
-        )
-    return "\n".join(lines)
-
-
-def run_get_task(task_id: str) -> str:
-    try:
-        return get_task(task_id)
-    except ValueError as exc:
-        return f"Error: {exc}"
-    except FileNotFoundError:
-        return f"Error: Task {task_id} not found"
-
-
-def run_claim_task(task_id: str) -> str:
-    try:
-        return claim_task(task_id, owner="agent")
-    except ValueError as exc:
-        return f"Error: {exc}"
-    except FileNotFoundError:
-        return f"Error: Task {task_id} not found"
-
-
-def run_complete_task(task_id: str) -> str:
-    try:
-        return complete_task(task_id, owner="agent")
-    
-    except ValueError as exc:
-        return f"Error: {exc}"
-    except FileNotFoundError:
-        return f"Error: Task {task_id} not found"
-
-
-# -- MessageBus and Team Protocols --
-
+# region 08 MessageBus 与协议
+# 邮箱负责消息传递；计划审批和关闭请求用 request_id 关联，避免串消息。
 
 MAILBOX_DIR = WORKDIR / ".mailboxes"
 MAILBOX_ROOT = MAILBOX_DIR.resolve()
@@ -2137,101 +1910,6 @@ def current_work_identity(owner: str) -> tuple[int, str | None]:
         return assignment_versions.get(owner, 0), task_id
 
 
-def _teammate_submit_plan(from_name: str, plan: str) -> str:
-    """为成员提交计划建立待审批请求并通知主 Agent。
-
-    输入：
-        from_name (str)：当前发送消息或提交计划的成员名称。
-        plan (str)：成员提交的计划文本。
-
-    输出：
-        str：文本结果，可能是正常输出、状态摘要或当前实现返回的错误提示。
-        固定返回示例：'A plan is already waiting for review.'。
-
-    执行流程：
-        1. 进入 task_lock 上下文，执行受保护的操作并在退出时释放上下文资源。
-        2. 调用 BUS.send(from_name, 'lead', plan)。
-        3. 返回 f"Plan submitted ({request_id}). Wait for Lead's decision."，结束本次调用。
-
-    注意：
-        会按分支更新对象、集合或共享状态；调用时需注意当前任务和线程上下文。
-    """
-    with task_lock:
-        assignment = teammate_assignments.get(from_name)
-        task_id = str(assignment["task_id"]) if assignment else None
-        work_version = assignment_versions.get(from_name, 0)
-        with team_lock:
-            if plan_gates.get(from_name) == "pending":
-                return "A plan is already waiting for review."
-            request_id = new_request_id()
-            pending_requests[request_id] = ProtocolState(
-                request_id=request_id,
-                type="plan_approval",
-                sender=from_name,
-                target="lead",
-                status="pending",
-                payload=plan,
-                work_version=work_version,
-                task_id=task_id,
-            )
-            plan_gates[from_name] = "pending"
-            plan_request_ids[from_name] = request_id
-            active_teammates[from_name] = "waiting_approval"
-    BUS.send(
-        from_name, "lead", plan, "plan_approval_request", {"request_id": request_id}
-    )
-    return f"Plan submitted ({request_id}). Wait for Lead's decision."
-
-
-def _run_teammate_tool(name: str, block, handlers: dict) -> str:
-    """校验成员执行约束后，调用相应的工具处理函数。
-
-    输入：
-        name (str)：当前操作涉及的成员、服务、工具或工作流名称。
-        block：模型返回的工具调用块，包含工具名称与输入参数。
-        handlers (dict)：工具名称到处理函数的映射。
-
-    输出：
-        str：文本结果，可能是正常输出、状态摘要或当前实现返回的错误提示。
-
-    执行流程：
-        1. 调用 plan_gates.get，将结果保存到 gate。
-        2. 检查条件 block.name in {'bash', 'write_file', 'edit_file'}，按结果处理对应分支。
-        3. 调用 handlers.get，将结果保存到 handler。
-        4. 检查条件 not handler，按结果处理对应分支。
-        5. 条件满足时，返回 f'Unknown tool: {block.name}'，结束本次调用。
-        6. 调用 trigger_hooks('PreToolUse', block)。
-        7. 调用 str，将结果保存到 output。
-        8. 遇到 Exception 时进入对应 except 分支。
-        9. 调用 trigger_hooks('PostToolUse', block, output)。
-        10. 返回 output，结束本次调用。
-
-    注意：
-        只处理 except 中列出的异常；异常结果、重试或回退逻辑由对应分支决定。
-    """
-    gate = plan_gates.get(name, "not_required")
-    if block.name in {"bash", "write_file", "edit_file"}:
-        if gate != "approved":
-            if gate != "not_required":
-                return (
-                    f"Blocked: plan status is {gate}. Submit or revise the "
-                    "plan and wait for approval before changing the workspace."
-                )
-        blocked = check_permission(block, prompt_user=False)
-        if blocked:
-            return blocked
-    handler = handlers.get(block.name)
-    if not handler:
-        return f"Unknown tool: {block.name}"
-    trigger_hooks("PreToolUse", block, skip_permission=True)
-    try:
-        output = str(handler(**block.input))
-    except Exception as exc:
-        output = f"Error: {type(exc).__name__}: {exc}"
-    trigger_hooks("PostToolUse", block, output)
-    return output
-
-
 def apply_plan_response(name: str, msg: dict) -> tuple[bool, str]:
     """核验计划审批响应，并更新成员的审批状态。
 
@@ -2320,34 +1998,11 @@ def apply_shutdown_request(name: str, msg: dict) -> tuple[bool, str]:
         active_teammates[name] = "stopping"
     return True, request_id
 
-
-def _teammate_send_message(from_name: str, to: str, content: str) -> str:
-    """以指定成员身份向另一个 Agent 发送普通消息。
-
-    输入：
-        from_name (str)：当前发送消息或提交计划的成员名称。
-        to (str)：消息接收方名称。
-        content (str)：要写入文件、发送给成员或解析的内容。
-
-    输出：
-        str：文本结果，可能是正常输出、状态摘要或当前实现返回的错误提示。
-
-    执行流程：
-        1. 进入 team_lock 上下文，执行受保护的操作并在退出时释放上下文资源。
-        2. 调用 BUS.send(from_name, to, content)。
-        3. 返回 f'Sent to {to}'，结束本次调用。
-
-    注意：
-        本层未显式执行文件写入或启动线程；被调用函数的行为和异常仍遵循其各自约定。
-    """
-    with team_lock:
-        if to != "lead" and to not in active_teammates:
-            return f"Agent '{to}' is not active"
-    BUS.send(from_name, to, content)
-    return f"Sent to {to}"
+# endregion
 
 
-# -- Idle Task Discovery --
+# region 09 空闲任务发现
+# 只领取派发给自己且依赖已完成的任务，不抢其他成员的工作。
 
 IDLE_SCAN_INTERVAL = 2.0
 
@@ -2416,10 +2071,693 @@ def claim_next_task(name: str) -> Task | None:
             return load_task(task.id)
     return None
 
+# endregion
 
-# -- Teammate Runtime --
+
+# region 10 工具具体实现
+# 这一节是实际工作的 run_* 函数；第 12 节再声明模型可见的参数和执行映射。
+
+# -- 10.1 成员可用工具：创建时的权限决定可见 Schema 和实际 Handler --
+
+def teammate_tools(name):
+    """决定成员能向模型声明、也能实际执行哪些工具。
+
+    创建成员时 tools=[] 表示不开放工作区工具；仍能认领任务、沟通和提交计划。
+    这是应用层工具权限；允许 bash 就能通过命令访问文件，不是 OS 沙箱。
+    """
+    workspace = set(TEAM_MEMBERS[name].get("tools", [t["name"] for t in BASE_TOOLS]))
+    coordination = {"send_message", "submit_plan", "list_tasks", "claim_task", "complete_task"}
+    return [tool for tool in TEAMMATE_TOOLS if tool["name"] in workspace | coordination]
 
 
+# -- 10.2 基础操作：路径、命令执行、文件读写和匹配 --
+
+def safe_path(p: str, cwd: Path | None = None) -> Path:
+    base = (cwd or WORKDIR).resolve()
+    path = (base / p).resolve()
+    if not path.is_relative_to(base):
+        raise ValueError(f"Path escapes workspace: {p}")
+    return path
+
+
+def cmd_syntax_issue(command: str) -> str | None:
+    """提前识别误用的 PowerShell/Bash 分隔符，不改写用户命令。
+
+    只检查双引号外的字符，因此 python -c "a=1; print(a)" 仍合法。
+    CMD 的 ^ 转义会跳过下一字符。检测到错误直接说明实际 Shell，避免把
+    check.py; 当成文件名，或者多行命令只执行一部分却被误判为成功。
+    这不是完整 Shell 解析器；复杂命令建议先 write_file 写脚本，再单次执行。
+    """
+    quoted, index = False, 0
+    while index < len(command):
+        char = command[index]
+        if char == "^":
+            index += 2
+            continue
+        if char == '"':
+            quoted = not quoted
+        elif not quoted:
+            if char == ";":
+                return "cmd.exe 不使用分号分隔命令；请执行单个命令或使用 &&。"
+            if command[index:].startswith(("$?", "$LASTEXITCODE")):
+                return "当前是 cmd.exe，不支持 PowerShell 的 $? / $LASTEXITCODE；直接读取返回的 returncode。"
+            if char in "\r\n":
+                return "不要向 cmd.exe 传入多行命令；请用 write_file 写脚本，再执行该脚本。"
+        index += 1
+    return None
+
+
+def run_bash(command: str, cwd: Path | None = None, timeout: float = 120) -> str:
+    """执行非交互 Shell 命令，返回输出；超时结束整个子进程树。
+
+    command 是模型提供的命令；cwd 默认 WORKDIR；timeout 默认 120 秒。
+    模型仍通过原来的 bash 工具调用此函数，Agent Loop 的协议不变。
+    stdin 使用 DEVNULL，子程序不能偷偷读取用户正在给 Lead 输入的文字。
+    npm 默认不自动安装缺失的包：缺依赖时返回错误；模型若决定安装须明确使用 --yes。
+    每等待 15 秒打印进度，避免命令正在执行却没有任何可见状态。
+    Windows 超时时使用 taskkill /T 结束整棵命令树，不能只杀 cmd.exe：
+    npm 等子进程可能继续持有输出管道，让 communicate 再次无限等待。
+    """
+    if timeout <= 0:
+        return json.dumps({"ok": False, "returncode": None, "error": "timeout must be positive"})
+    actual_shell = "cmd.exe" if os.name == "nt" else "system shell"
+    if os.name == "nt":
+        issue = cmd_syntax_issue(command)
+        if issue:
+            return json.dumps({"ok": False, "returncode": None, "shell": actual_shell,
+                               "executed": False, "error": issue}, ensure_ascii=False)
+    started = time.monotonic()
+    tool_env = dict(os.environ)
+    # 只影响当前工具启动的子进程，不修改用户选择的 Python 环境或系统配置。
+    # Windows 重定向时 Python 可能使用 cp1252，中文输出会导致脚本异常退出。
+    tool_env["PYTHONIOENCODING"] = "utf-8"
+    tool_env["PYTHONUTF8"] = "1"
+    tool_env.setdefault("npm_config_yes", "false")
+    print(f"  [shell] start (limit {timeout:g}s): {command[:160]}", flush=True)
+    process = None
+    try:
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=cwd or WORKDIR,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8", errors="replace",
+            env=tool_env,
+            start_new_session=(os.name != "nt"),
+        )
+        deadline = started + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            try:
+                # 多次 communicate 会继续收集同一进程的输出，不会重新执行命令。
+                stdout, stderr = process.communicate(timeout=min(15, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= deadline:
+                    raise
+                print(f"  [shell] still running: {time.monotonic() - started:.0f}s", flush=True)
+        elapsed = time.monotonic() - started
+        print(f"  [shell] finished: exit={process.returncode}, {elapsed:.1f}s", flush=True)
+        # 关键：returncode=0 也必须交给模型，不能只打印在开发者终端。
+        # stdout/stderr 分开，模型不必拼 echo %ERRORLEVEL% 来猜执行结果。
+        return json.dumps({"ok": process.returncode == 0, "returncode": process.returncode,
+                           "shell": actual_shell, "cwd": str((cwd or WORKDIR).resolve()),
+                           "stdout": stdout[:24000], "stderr": stderr[:24000],
+                           "truncated": len(stdout) > 24000 or len(stderr) > 24000,
+                           "seconds": round(elapsed, 3)}, ensure_ascii=False)
+    except subprocess.TimeoutExpired:
+        # 显式清理后，再有界收尾；不使用 subprocess.run 的无界 Windows 管道等待。
+        if process is not None:
+            try:
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=10,
+                    )
+                else:
+                    import signal
+                    os.killpg(process.pid, signal.SIGKILL)
+            except (OSError, subprocess.TimeoutExpired):
+                # 父进程可能已经结束；仍尝试结束当前句柄，不再无限等待输出。
+                if process.poll() is None:
+                    process.kill()
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                print("  [shell] a descendant still holds the output pipe; stopped waiting", flush=True)
+        print(f"  [shell] timeout after {timeout:g}s; process-tree cleanup attempted", flush=True)
+        return json.dumps({"ok": False, "returncode": None, "shell": actual_shell,
+                           "timed_out": True, "error": f"Timeout ({timeout:g}s); process-tree cleanup attempted."})
+    except OSError as exc:
+        return json.dumps({"ok": False, "returncode": None, "shell": actual_shell,
+                           "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False)
+
+
+def run_read(path: str, limit: int | None = None, cwd: Path | None = None) -> str:
+    try:
+        lines = safe_path(path, cwd).read_text(encoding="utf-8").splitlines()
+        if limit and limit < len(lines):
+            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def run_write(path: str, content: str, cwd: Path | None = None) -> str:
+    try:
+        fp = safe_path(path, cwd)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(content, encoding="utf-8")
+        return f"Wrote {len(content)} bytes to {path}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def run_edit(path: str, old_text: str, new_text: str, cwd: Path | None = None) -> str:
+    try:
+        target = safe_path(path, cwd)
+        content = target.read_text(encoding="utf-8")
+        count = content.count(old_text)
+        if count != 1:
+            return f"Error: Expected 1 occurrence, found {count}"
+        target.write_text(content.replace(old_text, new_text), encoding="utf-8")
+        return f"Edited {path}"
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+def run_glob(pattern: str, cwd: Path | None = None) -> str:
+    try:
+        base = (cwd or WORKDIR).resolve()
+        matches = [
+            str(path.relative_to(base))
+            for path in sorted(base.glob(pattern))
+            if path.resolve().is_relative_to(base)
+        ]
+        shown = matches[:200]
+        if len(matches) > 200:
+            shown.append("... (more matches omitted; narrow the pattern)")
+        return "\n".join(shown) or "No files found"
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+# -- 10.3 Lead 工作目录适配：已认领任务用任务目录，否则用工作区 --
+
+def _agent_cwd() -> tuple[Path | None, str | None]:
+    try:
+        return assignment_cwd("agent"), None
+    except (FileNotFoundError, ValueError) as exc:
+        return None, f"Error: Invalid task assignment: {exc}"
+
+
+def run_agent_bash(command: str) -> str:
+    cwd, error = _agent_cwd()
+    return error or run_bash(command, cwd)
+
+
+def run_agent_read(path: str, limit: int | None = None) -> str:
+    cwd, error = _agent_cwd()
+    return error or run_read(path, limit, cwd)
+
+
+def run_agent_write(path: str, content: str) -> str:
+    cwd, error = _agent_cwd()
+    return error or run_write(path, content, cwd)
+
+
+def run_agent_edit(path: str, old_text: str, new_text: str) -> str:
+    cwd, error = _agent_cwd()
+    return error or run_edit(path, old_text, new_text, cwd)
+
+
+def run_agent_glob(pattern: str) -> str:
+    cwd, error = _agent_cwd()
+    return error or run_glob(pattern, cwd)
+
+
+# -- 10.4 任务工具：调用唯一的共享 TaskStore --
+
+def run_create_task(subject: str, description: str = "") -> str:
+    task = create_task(subject, description)
+    print(f"  \033[34m[create] {task.subject}\033[0m")
+    return f"Created {task.id}: {task.subject}"
+
+
+def run_update_task(task_id: str, addBlockedBy: list[str]) -> str:
+    try:
+        task = update_task(task_id, addBlockedBy)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    except FileNotFoundError:
+        return f"Error: Task {task_id} not found"
+    dependencies = ", ".join(task.blockedBy) or "(none)"
+    print(f"  \033[34m[update] {task.subject} blockedBy: {dependencies}\033[0m")
+    return f"Updated {task.id} blockedBy: {dependencies}"
+
+
+def run_list_tasks() -> str:
+    tasks = list_tasks()
+    if not tasks:
+        return "No tasks. Use create_task to add some."
+    lines = []
+    for t in tasks:
+        icon = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}.get(
+            t.status, "[?]"
+        )
+        deps = f" (blockedBy: {', '.join(t.blockedBy)})" if t.blockedBy else ""
+        owner = f" [{t.owner}]" if t.owner else ""
+        worktree = f" (worktree: {t.worktree})" if t.worktree else ""
+        worktree += f" (assignee: {t.assignee})" if t.assignee else " (not dispatched)"
+        lines.append(
+            f"  {icon} {t.id}: {t.subject} [{t.status}]{owner}{deps}{worktree}"
+        )
+    return "\n".join(lines)
+
+
+def run_get_task(task_id: str) -> str:
+    try:
+        return get_task(task_id)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    except FileNotFoundError:
+        return f"Error: Task {task_id} not found"
+
+
+def run_claim_task(task_id: str) -> str:
+    try:
+        return claim_task(task_id, owner="agent")
+    except ValueError as exc:
+        return f"Error: {exc}"
+    except FileNotFoundError:
+        return f"Error: Task {task_id} not found"
+
+
+def run_complete_task(task_id: str) -> str:
+    try:
+        return complete_task(task_id, owner="agent")
+
+    except ValueError as exc:
+        return f"Error: {exc}"
+    except FileNotFoundError:
+        return f"Error: Task {task_id} not found"
+
+
+# -- 10.5 子 Agent 消息与计划提交：绑定真实发送者身份 --
+
+def _teammate_submit_plan(from_name: str, plan: str) -> str:
+    """为成员提交计划建立待审批请求并通知主 Agent。
+
+    输入：
+        from_name (str)：当前发送消息或提交计划的成员名称。
+        plan (str)：成员提交的计划文本。
+
+    输出：
+        str：文本结果，可能是正常输出、状态摘要或当前实现返回的错误提示。
+        固定返回示例：'A plan is already waiting for review.'。
+
+    执行流程：
+        1. 进入 task_lock 上下文，执行受保护的操作并在退出时释放上下文资源。
+        2. 调用 BUS.send(from_name, 'lead', plan)。
+        3. 返回 f"Plan submitted ({request_id}). Wait for Lead's decision."，结束本次调用。
+
+    注意：
+        会按分支更新对象、集合或共享状态；调用时需注意当前任务和线程上下文。
+    """
+    with task_lock:
+        assignment = teammate_assignments.get(from_name)
+        task_id = str(assignment["task_id"]) if assignment else None
+        work_version = assignment_versions.get(from_name, 0)
+        with team_lock:
+            if plan_gates.get(from_name) == "pending":
+                return "A plan is already waiting for review."
+            request_id = new_request_id()
+            pending_requests[request_id] = ProtocolState(
+                request_id=request_id,
+                type="plan_approval",
+                sender=from_name,
+                target="lead",
+                status="pending",
+                payload=plan,
+                work_version=work_version,
+                task_id=task_id,
+            )
+            plan_gates[from_name] = "pending"
+            plan_request_ids[from_name] = request_id
+            active_teammates[from_name] = "waiting_approval"
+    BUS.send(
+        from_name, "lead", plan, "plan_approval_request", {"request_id": request_id}
+    )
+    return f"Plan submitted ({request_id}). Wait for Lead's decision."
+
+
+def _teammate_send_message(from_name: str, to: str, content: str) -> str:
+    """以指定成员身份向另一个 Agent 发送普通消息。
+
+    输入：
+        from_name (str)：当前发送消息或提交计划的成员名称。
+        to (str)：消息接收方名称。
+        content (str)：要写入文件、发送给成员或解析的内容。
+
+    输出：
+        str：文本结果，可能是正常输出、状态摘要或当前实现返回的错误提示。
+
+    执行流程：
+        1. 进入 team_lock 上下文，执行受保护的操作并在退出时释放上下文资源。
+        2. 调用 BUS.send(from_name, to, content)。
+        3. 返回 f'Sent to {to}'，结束本次调用。
+
+    注意：
+        本层未显式执行文件写入或启动线程；被调用函数的行为和异常仍遵循其各自约定。
+    """
+    with team_lock:
+        if to != "lead" and to not in active_teammates:
+            return f"Agent '{to}' is not active"
+    BUS.send(from_name, to, content)
+    return f"Sent to {to}"
+
+
+# -- 10.6 Lead 团队工具：动态创建、查询、消息、审批和关闭 --
+
+def run_spawn_teammate(
+    name: str,
+    role: str,
+    prompt: str,
+    task_id: str | None = None,
+    require_plan: bool = False,
+    tools: list[str] | None = None,
+) -> str:
+    """把模型自选的名字、职责、任务和工具权限交给动态创建逻辑。
+
+    不需要先在 JSON 中登记成员。是否调用此工具由 Lead 决定。
+    task_id 如提供，必须已派发给同名成员且依赖就绪；运行时会自动认领。
+    """
+    return spawn_teammate_thread(name, role, prompt, task_id, require_plan, tools)
+
+
+def run_list_teammates() -> str:
+    """将团队成员及其当前运行状态格式化为文本。
+
+    输入：
+        无显式输入参数；所需状态由当前对象或模块保存。
+
+    输出：
+        str：文本结果，可能是正常输出、状态摘要或当前实现返回的错误提示。
+        固定返回示例：'No active teammates.'。
+
+    执行流程：
+        1. 进入 team_lock 上下文，执行受保护的操作并在退出时释放上下文资源。
+        2. 返回 '\\n'.join((f'{name}: {status}' for name, status in sorted(active_teammates.items())))，结束本次调用。
+
+    注意：
+        本层未显式执行文件写入或启动线程；被调用函数的行为和异常仍遵循其各自约定。
+    """
+    with team_lock:
+        if not active_teammates:
+            return "No active teammates."
+        return "\n".join(
+            f"{name} ({TEAM_MEMBERS[name]['role']}): {status}"
+            for name, status in sorted(active_teammates.items())
+        )
+
+
+def run_send_message(to: str, content: str) -> str:
+    """以主 Agent 身份向指定成员发送消息。
+
+    输入：
+        to (str)：消息接收方名称。
+        content (str)：要写入文件、发送给成员或解析的内容。
+
+    输出：
+        str：文本结果，可能是正常输出、状态摘要或当前实现返回的错误提示。
+
+    执行流程：
+        1. 检查条件 to not in active_teammates，按结果处理对应分支。
+        2. 条件满足时，返回 f"Teammate '{to}' is not active"，结束本次调用。
+        3. 调用 BUS.send('lead', to, content)。
+        4. 返回 f'Sent to {to}'，结束本次调用。
+
+    注意：
+        本层未显式执行文件写入或启动线程；被调用函数的行为和异常仍遵循其各自约定。
+    """
+    if to not in active_teammates:
+        return f"Teammate '{to}' is not active"
+    BUS.send("lead", to, content)
+    '''比如
+    BUS.send(
+        from_agent="lead",
+        to="alice",
+        content="游戏规则已完成 请查看game_design.md",
+    )
+    '''
+    return f"Sent to {to}"
+
+
+def run_request_shutdown(teammate: str) -> str:
+    """创建关联请求并向成员发送关闭请求。
+
+    输入：
+        teammate (str)：目标团队成员的名称。
+
+    输出：
+        str：文本结果，可能是正常输出、状态摘要或当前实现返回的错误提示。
+
+    执行流程：
+        1. 检查条件 teammate not in active_teammates，按结果处理对应分支。
+        2. 条件满足时，返回 f"Teammate '{teammate}' is not active"，结束本次调用。
+        3. 进入 team_lock 上下文，执行受保护的操作并在退出时释放上下文资源。
+        4. 调用 BUS.send('lead', teammate, 'Finish the current step and shut down.')。
+        5. 返回 f'Shutdown requested from {teammate} ({request_id})'，结束本次调用。
+
+    注意：
+        会按分支更新对象、集合或共享状态；调用时需注意当前任务和线程上下文。
+    """
+    if teammate not in active_teammates:
+        return f"Teammate '{teammate}' is not active"
+    with team_lock:
+        request_id = new_request_id()
+        pending_requests[request_id] = ProtocolState(
+            request_id=request_id,
+            type="shutdown",
+            sender="lead",
+            target=teammate,
+            status="pending",
+            payload="",
+        )
+    BUS.send(
+        "lead",
+        teammate,
+        "Finish the current step and shut down.",
+        "shutdown_request",
+        {"request_id": request_id},
+    )
+    return f"Shutdown requested from {teammate} ({request_id})"
+
+
+def run_request_plan(teammate: str, task: str) -> str:
+    """向指定成员发起与当前任务关联的计划请求。
+
+    输入：
+        teammate (str)：目标团队成员的名称。
+        task (str)：当前任务对象；具体字段由所属课程的数据类定义。
+
+    输出：
+        str：文本结果，可能是正常输出、状态摘要或当前实现返回的错误提示。
+
+    执行流程：
+        1. 检查条件 teammate not in active_teammates，按结果处理对应分支。
+        2. 条件满足时，返回 f"Teammate '{teammate}' is not active"，结束本次调用。
+        3. 进入 team_lock 上下文，执行受保护的操作并在退出时释放上下文资源。
+        4. 调用 BUS.send('lead', teammate, task)。
+        5. 返回 f'Plan requested from {teammate}'，结束本次调用。
+
+    注意：
+        会按分支更新对象、集合或共享状态；调用时需注意当前任务和线程上下文。
+    """
+    if teammate not in active_teammates:
+        return f"Teammate '{teammate}' is not active"
+    with team_lock:
+        plan_gates[teammate] = "required"
+    BUS.send("lead", teammate, task, "plan_request")
+    return f"Plan requested from {teammate}"
+
+
+def run_review_plan(request_id: str, approve: bool, feedback: str = "") -> str:
+    """核验待审批计划，并发送通过或拒绝的反馈。
+
+    输入：
+        request_id (str)：用于关联请求和响应的协议 ID。
+        approve (bool)：是否同意当前计划或协议请求。
+        feedback (str)：对计划审批或拒绝原因的补充文本。 默认值：''。
+
+    输出：
+        str：文本结果，可能是正常输出、状态摘要或当前实现返回的错误提示。
+
+    执行流程：
+        1. 调用 pending_requests.get，将结果保存到 state。
+        2. 检查条件 not state，按结果处理对应分支。
+        3. 条件满足时，返回 f'Request {request_id} not found'，结束本次调用。
+        4. 调用 current_work_identity，将结果保存到 (work_version, task_id)。
+        5. 进入 team_lock 上下文，执行受保护的操作并在退出时释放上下文资源。
+        6. 设置 content，取值为 feedback or ('Plan approved.' if approve else 'Revise the plan and submit it again.')。
+        7. 调用 BUS.send('lead', state.sender, content)。
+        8. 返回 f'Plan {state.status} ({request_id})'，结束本次调用。
+
+    注意：
+        会按分支更新对象、集合或共享状态；调用时需注意当前任务和线程上下文。
+    """
+    state = pending_requests.get(request_id)
+    if not state:
+        return f"Request {request_id} not found"
+    work_version, task_id = current_work_identity(state.sender)
+    with team_lock:
+        state = pending_requests.get(request_id)
+        if not state:
+            return f"Request {request_id} not found"
+        if state.type != "plan_approval":
+            return f"Request {request_id} is not a plan"
+        if state.status != "pending":
+            return f"Request {request_id} already {state.status}"
+        if state.work_version != work_version or state.task_id != task_id:
+            return f"Request {request_id} belongs to an earlier assignment"
+        if plan_request_ids.get(state.sender) != request_id:
+            return f"Request {request_id} is not the current plan"
+        state.status = "approved" if approve else "rejected"
+    content = feedback or (
+        "Plan approved." if approve else "Revise the plan and submit it again."
+    )
+    BUS.send(
+        "lead",
+        state.sender,
+        content,
+        "plan_approval_response",
+        {"request_id": request_id, "approve": approve},
+    )
+    return f"Plan {state.status} ({request_id})"
+
+
+def run_create_worktree(name: str, task_id: str) -> str:
+    """以工具接口调用工作树创建与任务绑定逻辑。
+
+    输入：
+        name (str)：当前操作涉及的成员、服务、工具或工作流名称。
+        task_id (str)：本次操作关联的任务 ID。
+
+    输出：
+        str：文本结果，可能是正常输出、状态摘要或当前实现返回的错误提示。
+
+    执行流程：
+        1. 返回 create_worktree(name, task_id)，结束本次调用。
+
+    注意：
+        本层未显式执行文件写入或启动线程；被调用函数的行为和异常仍遵循其各自约定。
+    """
+    return create_worktree(name, task_id)
+
+
+# -- 10.7 任务派发与交付：不要求预设成员或创建任何子 Agent --
+
+def run_assign_task(task_id: str, assignee: str) -> str:
+    """建完依赖后才发布任务，避免空闲队友在连边之前抢先开工。"""
+    # 允许先派发再创建；名字只需合法，不要求存在于某个固定名单。
+    if (not isinstance(assignee, str) or not is_valid_agent_name(assignee)
+            or assignee.lower() in RESERVED_TEAMMATE_NAMES):
+        return "Error: assignee must be a valid non-reserved teammate name"
+    with team_lock:
+        existing = next((n for n in TEAM_MEMBERS if n.casefold() == assignee.casefold()), None)
+        if existing is not None and (existing != assignee or existing not in active_teammates):
+            return "Error: teammate is inactive or name casing does not match; choose an active or new name"
+    try:
+        with task_store_lock():
+            task = load_task(task_id)
+            if task.status != "pending" or task.owner:
+                return "Error: task must be pending and unowned"
+            if task.assignee is not None and task.assignee != assignee:
+                return "Error: task is already dispatched; create a replacement task instead"
+            task.assignee = assignee
+            save_task(task)
+        # 通知只唤醒队友，任务板才是所有权与依赖的事实来源。
+        with team_lock:
+            active = assignee in active_teammates
+        if active:
+            BUS.send(
+                "lead",
+                assignee,
+                f"Task dispatched: {task.id}. Claim it only when ready.",
+            )
+        return f"Assigned {task.id} to {assignee}"
+    except (ValueError, FileNotFoundError) as exc:
+        return f"Error: {exc}"
+
+
+def run_accept_delivery(artifacts: list[str]) -> str:
+    """验收真实产物及已有任务，不要求创建任何子 Agent。
+
+    Lead 直接完成文件时允许任务板为空；一旦有任务，仍要求全部完成。
+    不再检查固定成员是否参加。可选质量报告引用实际执行者的完成任务，
+    执行者可以是 Lead 或动态创建的成员，不能用不属于任何执行者的记录。
+    """
+    try:
+        if not isinstance(artifacts, list) or not artifacts or any(not isinstance(p, str) or not p.strip() for p in artifacts):
+            return "Error: artifacts must be a nonempty list of file paths"
+        with task_store_lock():
+            tasks = list_tasks()
+            if any(t.status != "completed" for t in tasks):
+                return "Error: all tasks must be completed before acceptance"
+            paths = list(dict.fromkeys([*artifacts, *DELIVERY_REQUIRED_FILES]))
+            for path in paths:
+                if not safe_path(path).is_file():
+                    return f"Error: delivery file does not exist: {path}"
+            report_path = QUALITY_REPORT_PATH
+            report = None
+            if report_path is not None:
+                report = json.loads(safe_path(report_path).read_text(encoding="utf-8"))
+                if not isinstance(report, dict):
+                    return "Error: quality report must be an object"
+                qa = next((t for t in tasks if t.id == report.get("task_id")), None)
+                if qa is None or qa.status != "completed" or not qa.owner:
+                    return "Error: quality report must reference an owned completed check task"
+                if qa.owner == "agent":
+                    valid_owner = qa.assignee is None  # Lead 自己领取的任务。
+                else:
+                    valid_owner = qa.owner in TEAM_MEMBERS and qa.assignee == qa.owner
+                if not valid_owner:
+                    return "Error: quality report task must belong to Lead or a dynamically created teammate"
+                # issues 为通用格式；也识别旧游戏报告中的 bugs，避免绕过已知问题。
+                if report.get("passed") is not True or report.get("issues", report.get("bugs")) != [] or report.get("bugs", []) != []:
+                    return "Error: quality report has not passed or has unresolved issues"
+                checks = report.get("checks")
+                if not isinstance(checks, list) or not checks or any(
+                    not isinstance(c, dict) or not isinstance(c.get("command"), str)
+                    or not c["command"].strip() or type(c.get("returncode")) is not int
+                    or c["returncode"] != 0 or not isinstance(c.get("output"), str)
+                    for c in checks
+                ):
+                    return "Error: quality report requires successful check commands and outputs"
+            delivery = {"status": "accepted", "team": TEAM_NAME, "artifacts": paths,
+                        "report": report_path, "scope": "Configured file/task/report checks; execution evidence must be verified independently"}
+            if report is not None:
+                delivery["review_task_id"] = report["task_id"]
+            safe_path("delivery.json").write_text(json.dumps(delivery, ensure_ascii=False, indent=2), encoding="utf-8")
+            return json.dumps(delivery, ensure_ascii=False)
+    except (ValueError, OSError, TypeError, AttributeError) as exc:
+        return f"Error: {exc}"
+
+# endregion
+
+
+# region 11 子 Agent 生命周期
+# 独立消息历史、WORK/IDLE 循环与动态线程创建；不在启动时预建成员。
+
+#子agent线程
 class TeammateRuntime:
     """One persistent teammate with separate messages and WORK/IDLE phases."""
 
@@ -2455,17 +2793,20 @@ class TeammateRuntime:
             "Task, then call complete_task and report a concise result. "
             "If the first user message contains [Assigned task], that Task is "
             "already claimed; do not call claim_task for it again. "
-            "When asked for a plan, call submit_plan and wait for approval "
-            "before bash or file changes. File and shell tools use the Task's "
+            "Only call submit_plan when the runtime marks [Plan required]; otherwise complete the Task without approval. "
+            "Follow explicit approval gates before bash/file changes. File and shell tools use the Task's "
             "working directory; that directory is not a sandbox. The runtime "
             "delivers your final text to Lead. Use send_message only for "
             "intermediate coordination, and address the coordinator as 'lead'."
         )
         # [Team Framework] 身份/上下文仍由原版每个 TeammateRuntime 独立保存。
         self.system += (
-            "\n配置成员职责："
-            + TEAM_MEMBERS[name]["instructions"]
+            "\n子 Agent 通用约束（具体职责见本次任务说明）："
+            + TEAMMATE_PROMPT
             + "\n只处理 assignee 等于自己名字的任务。所有产物限制在当前工作区。"
+            # Lead 知道 Shell 类型并不代表队友知道；每个独立上下文都要明确说明。
+            + "\n执行环境：" + ENVIRONMENT_PROMPT
+            + "。Shell 结果为 JSON，直接读取 returncode/stdout/stderr；当前目录已绑定任务目录，不必先 cd。"
             + PROMPT_SECTIONS["delivery"]
         )
         self.messages = [{"role": "user", "content": prompt}]
@@ -2807,7 +3148,10 @@ class TeammateRuntime:
             # 不需要等待计划审批的正常流程 Alice接下来还会继续工作，Bob也会继续工作
             with team_lock:
                 active_teammates[self.name] = "idle"
-            BUS.send(self.name, "lead", "Waiting for more work.", "idle_notification")
+            # 本轮已经发送 result 时，不再发送内容重复的 idle 事件。
+            # 否则 Lead 可能刚处理完 result，又为“我空闲了”多调用一次模型。
+            if not summary:
+                BUS.send(self.name, "lead", "Waiting for more work.", "idle_notification")
         return "idle"
 
     def wait_for_work(self) -> bool:
@@ -2916,88 +3260,77 @@ def spawn_teammate_thread(
     prompt: str,
     task_id: str | None = None,
     require_plan: bool = False,
+    tools: list[str] | None = None,
 ) -> str:
-    """校验成员参数、登记运行状态并启动成员工作线程。
+    """根据 Lead 的工具参数动态创建成员，不检查预设名单。
 
-    输入：
-        name (str)：当前操作涉及的成员、服务、工具或工作流名称。
-        role (str)：新成员的角色描述。
-        prompt (str)：交给模型或定时任务执行的提示文本。
-        task_id (str | None)：本次操作关联的任务 ID。 默认值：None。
-        require_plan (bool)：是否要求成员先提交计划并等待审批。 默认值：False。
-
-    输出：
-        str：文本结果，可能是正常输出、状态摘要或当前实现返回的错误提示。
-        固定返回示例：'Invalid teammate name: use 1-64 letters, digits, underscores, or dashes'。
-
-    执行流程：
-        1. 检查条件 not is_valid_agent_name(name)，按结果处理对应分支。
-        2. 条件满足时，返回 'Invalid teammate name: use 1-64 letters, digits, underscores, or dashes'，结束本次调用。
-        3. 检查条件 name.lower() in RESERVED_TEAMMATE_NAMES，按结果处理对应分支。
-        4. 条件满足时，返回 f"Invalid teammate name: '{name}' is reserved by the runtime"，结束本次调用。
-        5. 进入 team_lock 上下文，执行受保护的操作并在退出时释放上下文资源。
-        6. 检查条件 task_id，按结果处理对应分支。
-        7. 调用 TeammateRuntime，将结果保存到 runtime。
-        8. 调用 threading.Thread，将结果保存到 thread。
-        9. 进入 team_lock 上下文，执行受保护的操作并在退出时释放上下文资源。
-        10. 调用 thread.start()。
-        11. 调用 print(f'  [teammate] {name} spawned as {role}')。
-        12. 设置 assigned，取值为 f' for {task_id}' if task_id else ' without an initial Task'。
-        13. 返回 f"Teammate '{name}' spawned as {role}{assigned}. End this turn; the runtime will deliver its events."，结束本次调用。
-
-    注意：
-        会按分支更新对象、集合或共享状态；调用时需注意当前任务和线程上下文。
-        可能启动线程或子进程；结束与清理方式以本函数及调用方的约定为准。
-        执行时会向终端打印状态、结果或调试信息。
-        只处理 except 中列出的异常；异常结果、重试或回退逻辑由对应分支决定。
-        原有实现说明（保留）：
-            Claim an initial Task, then start one persistent teammate.
+    name 是邮箱和任务身份，role 是自由职责，prompt 是这次工作的具体要求。
+    tools 省略时继承 TEAMMATE_ALLOWED_TOOLS 工具上限；传入列表只能收窄权限。
+    先登记元数据供 TeammateRuntime 获取工具权限，再认领初始任务并启动线程。
+    若认领或启动失败，回滚登记和占用，避免留下无法使用的“幽灵成员”。
     """
-    # name 是任务/邮箱身份，role 是配置的职责标签；允许多人使用相同角色。
-    if name not in TEAM_MEMBERS or role != TEAM_MEMBERS[name]["role"]:
-        return "Error: name and role must match the configured team members"
-    if not is_valid_agent_name(name):
-        return "Invalid teammate name: use 1-64 letters, digits, underscores, or dashes"
+    if not isinstance(name, str) or not is_valid_agent_name(name):
+        return "Error: Invalid teammate name: use 1-64 letters, digits, underscores, or dashes"
     if name.lower() in RESERVED_TEAMMATE_NAMES:
-        return f"Invalid teammate name: '{name}' is reserved by the runtime"
+        return f"Error: Invalid teammate name: '{name}' is reserved by the runtime"
+    if not isinstance(role, str) or not role.strip() or not isinstance(prompt, str) or not prompt.strip():
+        return "Error: role and prompt must be nonempty strings"
+    if type(require_plan) is not bool:
+        return "Error: require_plan must be a boolean"
+    try:
+        allowed = validate_workspace_tools(TEAMMATE_ALLOWED_TOOLS if tools is None else tools)
+        if not set(allowed) <= set(TEAMMATE_ALLOWED_TOOLS):
+            return "Error: tools exceed TEAMMATE_ALLOWED_TOOLS permissions"
+    except ValueError as exc:
+        return f"Error: {exc}"
     with team_lock:
-        if any(existing.casefold() == name.casefold() for existing in active_teammates):
-            return f"Teammate '{name}' already exists"
+        # 同一身份不能同时启动两次。退出后允许以原职责重启，继续中断的任务，
+        # 但不能用大小写变体或新职责冒用旧任务/邮箱身份。
+        existing = next((n for n in TEAM_MEMBERS if n.casefold() == name.casefold()), None)
+        if existing is not None:
+            if existing != name or name in active_teammates:
+                return f"Error: Teammate '{name}' already exists; use its exact name and wait until it stops"
+            if TEAM_MEMBERS[name]["role"] != role:
+                return f"Error: Teammate '{name}' has a different role; choose a new name"
+        previous_member = TEAM_MEMBERS.get(name)
+        previous_version = assignment_versions.get(name)
+        TEAM_MEMBERS[name] = {"name": name, "role": role, "instructions": prompt, "tools": allowed}
         active_teammates[name] = "working"
         plan_gates[name] = "required" if require_plan else "not_required"
-        assignment_versions[name] = 0
+        assignment_versions.setdefault(name, 0)
 
-    if task_id:
+    def rollback():
+        # 释放函数可能访问任务锁；不要在持有 team_lock 时调用，遵循原锁顺序。
         try:
-            # 尝试认领任务 把状态pending->in_progress
-            claimed = claim_task(task_id, owner=name)
-        except (FileNotFoundError, ValueError) as exc:
-            claimed = f"Error: {exc}"
-        if not claimed.startswith("Claimed "):
+            release_teammate_assignment(name)
+        finally:
             with team_lock:
+                if previous_member is None:
+                    TEAM_MEMBERS.pop(name, None)
+                else:
+                    TEAM_MEMBERS[name] = previous_member
                 active_teammates.pop(name, None)
                 plan_gates.pop(name, None)
+                plan_request_ids.pop(name, None)
                 assignment_versions.pop(name, None)
-            return f"Cannot spawn teammate '{name}': {claimed}"
-    # 创建成员运行环境
-    runtime = TeammateRuntime(name, role, prompt, task_id, require_plan)
-    '''每创建一个团队成员 就会创建独立的teammateruntime对象 保存如下信息
-    self.name = name
-    self.system = "you are..."
-    self.messages = [{"role": "user", "content": prompt}]
-    '''
-    # 启动成员线程 thread.start()启动成员循环
-    thread = threading.Thread(target=runtime.run, daemon=True)
-    '''成员创建后 假设三个成员都创建了
-    avtive_teammates = {
-        "designer": "working", 处于工作状态
-        "programmer": "working", 处于工作状态
-        "tester": "idle" 处于空闲状态
-    }  
-    '''
-    with team_lock:
-        teammate_threads[name] = thread
-    thread.start()
+                if previous_version is not None:
+                    assignment_versions[name] = previous_version
+                teammate_threads.pop(name, None)
+
+    try:
+        if task_id:
+            claimed = claim_task(task_id, owner=name)
+            if not claimed.startswith("Claimed "):
+                rollback()
+                return f"Cannot spawn teammate '{name}': {claimed}"
+        runtime = TeammateRuntime(name, role, prompt, task_id, require_plan)
+        thread = threading.Thread(target=runtime.run, name=f"agent:{name}", daemon=True)
+        with team_lock:
+            teammate_threads[name] = thread
+        thread.start()
+    except Exception as exc:
+        rollback()
+        return f"Error: Cannot spawn teammate '{name}': {type(exc).__name__}: {exc}"
     print(f"  [teammate] {name} spawned as {role}")
     assigned = f" for {task_id}" if task_id else " without an initial Task"
     return (
@@ -3005,325 +3338,18 @@ def spawn_teammate_thread(
         "End this turn; the runtime will deliver its events."
     )
 
-
-# -- Lead Team Tools --
-
-
-def run_spawn_teammate(
-    name: str,
-    role: str,
-    prompt: str,
-    task_id: str | None = None,
-    require_plan: bool = False,
-) -> str:
-    """将模型工具参数转交给成员线程创建逻辑。
-
-    输入：
-        name (str)：当前操作涉及的成员、服务、工具或工作流名称。
-        role (str)：新成员的角色描述。
-        prompt (str)：交给模型或定时任务执行的提示文本。
-        task_id (str | None)：本次操作关联的任务 ID。 默认值：None。
-        require_plan (bool)：是否要求成员先提交计划并等待审批。 默认值：False。
-
-    输出：
-        str：文本结果，可能是正常输出、状态摘要或当前实现返回的错误提示。
-
-    执行流程：
-        1. 返回 spawn_teammate_thread(name, role, prompt, task_id, require_plan)，结束本次调用。
-
-    注意：
-        本层未显式执行文件写入或启动线程；被调用函数的行为和异常仍遵循其各自约定。
-    """
-    return spawn_teammate_thread(name, role, prompt, task_id, require_plan)
+# endregion
 
 
-def run_list_teammates() -> str:
-    """将团队成员及其当前运行状态格式化为文本。
-
-    输入：
-        无显式输入参数；所需状态由当前对象或模块保存。
-
-    输出：
-        str：文本结果，可能是正常输出、状态摘要或当前实现返回的错误提示。
-        固定返回示例：'No active teammates.'。
-
-    执行流程：
-        1. 进入 team_lock 上下文，执行受保护的操作并在退出时释放上下文资源。
-        2. 返回 '\\n'.join((f'{name}: {status}' for name, status in sorted(active_teammates.items())))，结束本次调用。
-
-    注意：
-        本层未显式执行文件写入或启动线程；被调用函数的行为和异常仍遵循其各自约定。
-    """
-    with team_lock:
-        if not active_teammates:
-            return "No active teammates."
-        return "\n".join(
-            f"{name}: {status}" for name, status in sorted(active_teammates.items())
-        )
-
-
-def run_send_message(to: str, content: str) -> str:
-    """以主 Agent 身份向指定成员发送消息。
-
-    输入：
-        to (str)：消息接收方名称。
-        content (str)：要写入文件、发送给成员或解析的内容。
-
-    输出：
-        str：文本结果，可能是正常输出、状态摘要或当前实现返回的错误提示。
-
-    执行流程：
-        1. 检查条件 to not in active_teammates，按结果处理对应分支。
-        2. 条件满足时，返回 f"Teammate '{to}' is not active"，结束本次调用。
-        3. 调用 BUS.send('lead', to, content)。
-        4. 返回 f'Sent to {to}'，结束本次调用。
-
-    注意：
-        本层未显式执行文件写入或启动线程；被调用函数的行为和异常仍遵循其各自约定。
-    """
-    if to not in active_teammates:
-        return f"Teammate '{to}' is not active"
-    BUS.send("lead", to, content)
-    '''比如
-    BUS.send(
-        from_agent="lead",
-        to="alice",
-        content="游戏规则已完成 请查看game_design.md",
-    )
-    '''
-    return f"Sent to {to}"
-
-
-def run_request_shutdown(teammate: str) -> str:
-    """创建关联请求并向成员发送关闭请求。
-
-    输入：
-        teammate (str)：目标团队成员的名称。
-
-    输出：
-        str：文本结果，可能是正常输出、状态摘要或当前实现返回的错误提示。
-
-    执行流程：
-        1. 检查条件 teammate not in active_teammates，按结果处理对应分支。
-        2. 条件满足时，返回 f"Teammate '{teammate}' is not active"，结束本次调用。
-        3. 进入 team_lock 上下文，执行受保护的操作并在退出时释放上下文资源。
-        4. 调用 BUS.send('lead', teammate, 'Finish the current step and shut down.')。
-        5. 返回 f'Shutdown requested from {teammate} ({request_id})'，结束本次调用。
-
-    注意：
-        会按分支更新对象、集合或共享状态；调用时需注意当前任务和线程上下文。
-    """
-    if teammate not in active_teammates:
-        return f"Teammate '{teammate}' is not active"
-    with team_lock:
-        request_id = new_request_id()
-        pending_requests[request_id] = ProtocolState(
-            request_id=request_id,
-            type="shutdown",
-            sender="lead",
-            target=teammate,
-            status="pending",
-            payload="",
-        )
-    BUS.send(
-        "lead",
-        teammate,
-        "Finish the current step and shut down.",
-        "shutdown_request",
-        {"request_id": request_id},
-    )
-    return f"Shutdown requested from {teammate} ({request_id})"
-
-
-def run_request_plan(teammate: str, task: str) -> str:
-    """向指定成员发起与当前任务关联的计划请求。
-
-    输入：
-        teammate (str)：目标团队成员的名称。
-        task (str)：当前任务对象；具体字段由所属课程的数据类定义。
-
-    输出：
-        str：文本结果，可能是正常输出、状态摘要或当前实现返回的错误提示。
-
-    执行流程：
-        1. 检查条件 teammate not in active_teammates，按结果处理对应分支。
-        2. 条件满足时，返回 f"Teammate '{teammate}' is not active"，结束本次调用。
-        3. 进入 team_lock 上下文，执行受保护的操作并在退出时释放上下文资源。
-        4. 调用 BUS.send('lead', teammate, task)。
-        5. 返回 f'Plan requested from {teammate}'，结束本次调用。
-
-    注意：
-        会按分支更新对象、集合或共享状态；调用时需注意当前任务和线程上下文。
-    """
-    if teammate not in active_teammates:
-        return f"Teammate '{teammate}' is not active"
-    with team_lock:
-        plan_gates[teammate] = "required"
-    BUS.send("lead", teammate, task, "plan_request")
-    return f"Plan requested from {teammate}"
-
-
-def run_review_plan(request_id: str, approve: bool, feedback: str = "") -> str:
-    """核验待审批计划，并发送通过或拒绝的反馈。
-
-    输入：
-        request_id (str)：用于关联请求和响应的协议 ID。
-        approve (bool)：是否同意当前计划或协议请求。
-        feedback (str)：对计划审批或拒绝原因的补充文本。 默认值：''。
-
-    输出：
-        str：文本结果，可能是正常输出、状态摘要或当前实现返回的错误提示。
-
-    执行流程：
-        1. 调用 pending_requests.get，将结果保存到 state。
-        2. 检查条件 not state，按结果处理对应分支。
-        3. 条件满足时，返回 f'Request {request_id} not found'，结束本次调用。
-        4. 调用 current_work_identity，将结果保存到 (work_version, task_id)。
-        5. 进入 team_lock 上下文，执行受保护的操作并在退出时释放上下文资源。
-        6. 设置 content，取值为 feedback or ('Plan approved.' if approve else 'Revise the plan and submit it again.')。
-        7. 调用 BUS.send('lead', state.sender, content)。
-        8. 返回 f'Plan {state.status} ({request_id})'，结束本次调用。
-
-    注意：
-        会按分支更新对象、集合或共享状态；调用时需注意当前任务和线程上下文。
-    """
-    state = pending_requests.get(request_id)
-    if not state:
-        return f"Request {request_id} not found"
-    work_version, task_id = current_work_identity(state.sender)
-    with team_lock:
-        state = pending_requests.get(request_id)
-        if not state:
-            return f"Request {request_id} not found"
-        if state.type != "plan_approval":
-            return f"Request {request_id} is not a plan"
-        if state.status != "pending":
-            return f"Request {request_id} already {state.status}"
-        if state.work_version != work_version or state.task_id != task_id:
-            return f"Request {request_id} belongs to an earlier assignment"
-        if plan_request_ids.get(state.sender) != request_id:
-            return f"Request {request_id} is not the current plan"
-        state.status = "approved" if approve else "rejected"
-    content = feedback or (
-        "Plan approved." if approve else "Revise the plan and submit it again."
-    )
-    BUS.send(
-        "lead",
-        state.sender,
-        content,
-        "plan_approval_response",
-        {"request_id": request_id, "approve": approve},
-    )
-    return f"Plan {state.status} ({request_id})"
-
-
-def run_create_worktree(name: str, task_id: str) -> str:
-    """以工具接口调用工作树创建与任务绑定逻辑。
-
-    输入：
-        name (str)：当前操作涉及的成员、服务、工具或工作流名称。
-        task_id (str)：本次操作关联的任务 ID。
-
-    输出：
-        str：文本结果，可能是正常输出、状态摘要或当前实现返回的错误提示。
-
-    执行流程：
-        1. 返回 create_worktree(name, task_id)，结束本次调用。
-
-    注意：
-        本层未显式执行文件写入或启动线程；被调用函数的行为和异常仍遵循其各自约定。
-    """
-    return create_worktree(name, task_id)
-
-
-# -- [Team Framework] Dispatch and Acceptance --
-
-
-def run_assign_task(task_id: str, assignee: str) -> str:
-    """建完依赖后才发布任务，避免空闲队友在连边之前抢先开工。"""
-    if assignee not in TEAM_MEMBERS:
-        return "Error: assignee must be a configured member: " + ", ".join(TEAM_MEMBERS)
-    try:
-        with task_store_lock():
-            task = load_task(task_id)
-            if task.status != "pending" or task.owner:
-                return "Error: task must be pending and unowned"
-            if task.assignee is not None and task.assignee != assignee:
-                return "Error: task is already dispatched; create a replacement task instead"
-            task.assignee = assignee
-            save_task(task)
-        # 通知只唤醒队友，任务板才是所有权与依赖的事实来源。
-        with team_lock:
-            active = assignee in active_teammates
-        if active:
-            BUS.send(
-                "lead",
-                assignee,
-                f"Task dispatched: {task.id}. Claim it only when ready.",
-            )
-        return f"Assigned {task.id} to {assignee}"
-    except (ValueError, FileNotFoundError) as exc:
-        return f"Error: {exc}"
-
-
-def run_accept_delivery(artifacts: list[str]) -> str:
-    """通用交付：完整任务、真实产物，加上配置要求的成员/文件/质量报告。
-
-    框架不认识“游戏入口”或固定 tester。研究报告、网页、游戏都只是产物文件。
-    JSON 的 required_members 按成员名检查，不按固定角色名检查。
-    质量报告只有配置启用时才强制要求，模型不能通过传另一个路径绕过政策。
-    """
-    try:
-        if not isinstance(artifacts, list) or not artifacts or any(not isinstance(p, str) or not p.strip() for p in artifacts):
-            return "Error: artifacts must be a nonempty list of file paths"
-        with task_store_lock():
-            tasks = list_tasks()
-            if not tasks or any(t.status != "completed" for t in tasks):
-                return "Error: all tasks must be completed before acceptance"
-            policy = TEAM_CONFIG["delivery"]
-            if any(not any(t.assignee == name for t in tasks) for name in policy["required_members"]):
-                return "Error: required members must each have a completed task"
-            paths = list(dict.fromkeys([*artifacts, *policy["required_files"]]))
-            for path in paths:
-                if not safe_path(path).is_file():
-                    return f"Error: delivery file does not exist: {path}"
-            report_path = policy["report_path"]
-            report = None
-            if report_path is not None:
-                report = json.loads(safe_path(report_path).read_text(encoding="utf-8"))
-                if not isinstance(report, dict):
-                    return "Error: quality report must be an object"
-                qa = next((t for t in tasks if t.id == report.get("task_id")), None)
-                reviewer = policy["report_owner"]
-                if qa is None or qa.owner != reviewer or qa.assignee != reviewer:
-                    return "Error: quality report must reference a completed task of report_owner"
-                # issues 为通用格式；也识别旧游戏报告中的 bugs，避免绕过已知问题。
-                if report.get("passed") is not True or report.get("issues", report.get("bugs")) != [] or report.get("bugs", []) != []:
-                    return "Error: quality report has not passed or has unresolved issues"
-                checks = report.get("checks")
-                if not isinstance(checks, list) or not checks or any(
-                    not isinstance(c, dict) or not isinstance(c.get("command"), str)
-                    or not c["command"].strip() or type(c.get("returncode")) is not int
-                    or c["returncode"] != 0 or not isinstance(c.get("output"), str)
-                    for c in checks
-                ):
-                    return "Error: quality report requires successful check commands and outputs"
-            delivery = {"status": "accepted", "team": TEAM_CONFIG["name"], "artifacts": paths,
-                        "report": report_path, "scope": "Configured file/task/report checks; execution evidence must be verified independently"}
-            if report is not None:
-                delivery["review_task_id"] = report["task_id"]
-            safe_path("delivery.json").write_text(json.dumps(delivery, ensure_ascii=False, indent=2), encoding="utf-8")
-            return json.dumps(delivery, ensure_ascii=False)
-    except (ValueError, OSError, TypeError, AttributeError) as exc:
-        return f"Error: {exc}"
-
-
-# -- Tool Definitions --
+# region 12 工具定义、映射与分发
+# 先定义 Schema，再合并 Lead 工具集合、建立映射，最后按 tool_use 执行。
 
 BASE_TOOLS = [
     {
         "name": "bash",
-        "description": "Run a shell command.",
+        "description": ("Execute one non-interactive command in the task directory. " + ENVIRONMENT_PROMPT +
+                        ". Returns JSON with returncode, stdout, stderr. Read returncode directly; do not append exit-code probes. "
+                        "Prefer one direct command; use write_file for multiline scripts."),
         "input_schema": {
             "type": "object",
             "properties": {"command": {"type": "string"}},
@@ -3476,7 +3502,7 @@ TEAM_TOOLS = [
     # 创建团队成员
     {
         "name": "spawn_teammate",
-        "description": "Spawn a persistent teammate.",
+        "description": "Optionally create a teammate with a name, role and task prompt you choose; no preset roster. For initial task_id, assign it to the same name first; spawn auto-claims it. Omit task_id when dependencies are blocked. tools may narrow TEAMMATE_ALLOWED_TOOLS.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -3485,6 +3511,7 @@ TEAM_TOOLS = [
                 "prompt": {"type": "string"},
                 "task_id": {"type": "string", "pattern": "^task_[0-9a-f]{8}$"},
                 "require_plan": {"type": "boolean"},
+                "tools": {"type": "array", "items": {"type": "string", "enum": ["bash", "read_file", "write_file", "edit_file", "glob"]}, "uniqueItems": True},
             },
             "required": ["name", "role", "prompt"],
         },
@@ -3557,30 +3584,35 @@ TEAM_TOOLS = [
         },
     },
 ]
-# 三种工具集合：基础工具、任务工具、团队工具
+# Lead 工具分组：基础、任务、团队、交付；TEAMMATE_TOOLS 是队友专用集合。
 # [Team Framework] 保留原工具定义格式，只向 Lead 增加派发与验收工具。
 # 派发属于通用任务工具；交付属于可配置的通用验收工具，不再绑定游戏。
 TASK_TOOLS.append({
-    "name": "assign_task", "description": "Dispatch a ready task to a configured member after dependency planning.",
+    "name": "assign_task", "description": "Dispatch a task after dependency planning to a valid teammate name you choose. The teammate may be created afterwards; only that name can claim it.",
     "input_schema": {"type": "object", "properties": {
         "task_id": {"type": "string"},
-        "assignee": {"type": "string", "enum": list(TEAM_MEMBERS)}},
+        "assignee": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"}},
         "required": ["task_id", "assignee"], "additionalProperties": False},
 })
 DELIVERY_TOOLS = [{
-    "name": "accept_delivery", "description": "Check completed tasks and artifacts against the configured delivery policy.",
+    "name": "accept_delivery", "description": "Check completed tasks and artifacts against the inline delivery settings.",
     "input_schema": {"type": "object", "properties": {
         "artifacts": {"type": "array", "items": {"type": "string"}, "minItems": 1}},
         "required": ["artifacts"], "additionalProperties": False},
 }]
+# TOOLS 是给 Lead 模型看的工具定义总集合：各分组在这里合并。
+# TEAMMATE_TOOLS 已复用了其中部分定义，不能再拼进来，否则工具名会重复。
+# 子 Agent 使用独立的 TEAMMATE_TOOLS，并进一步按创建时的权限筛选。
 TOOLS = [*BASE_TOOLS, *TASK_TOOLS, *TEAM_TOOLS, *DELIVERY_TOOLS]
 
-# 工具名称到处理函数的映射表，供 execute_tool 调用
+# TOOL_HANDLERS 是给 Python 执行器用的映射：工具名称 → 实际函数。
+# Schema 只是告诉模型“怎么调用”，映射表才告诉 execute_tool“执行哪个函数”。
+# Lead 的 TOOLS 与这里的键一一对应；队友的身份绑定映射在 TeammateRuntime 中创建。
 TOOL_HANDLERS = {
     # DELIVERY_TOOLS
     # 通用任务派发与可配置交付验收
     "assign_task": run_assign_task,# 派发任务给指定成员 TASK中会更新assignee字段 只有指定的成员才能认领任务
-    "accept_delivery": run_accept_delivery,# 验收交付物 检查所有任务是否完成 检查所有成员是否完成任务 检查交付物是否存在 检查质量报告是否通过
+    "accept_delivery": run_accept_delivery,  # 检查已有任务、真实文件及可选质量报告，不要求创建子 Agent。
     # BASE_TOOLS
     # 基础工具：命令执行、文件读写与文件匹配
     "bash": run_agent_bash,
@@ -3608,7 +3640,94 @@ TOOL_HANDLERS = {
 }
 
 
-# -- Hooks and Permission Checks --
+# -- 12.1 Lead 工具执行：通过全局 TOOL_HANDLERS 分发 --
+
+def execute_tool(block) -> str:
+    # 1.执行前检查
+    # 工具调用前触发 PreToolUse 钩子，检查权限和日志
+    # 如果钩子返回非空结果，说明工具调用被阻止，直接返回阻止信息
+    # 什么情况下会阻止工具调用？例如 bash 命令包含危险操作，或者文件路径不在工作目录内
+    blocked = trigger_hooks("PreToolUse", block)
+    if blocked:
+        return str(blocked)
+
+    # 2.找到对应的处理函数
+    # 传入block 从block.name就能获取工具名称，从TOOL_HANDLERS中获取对应的映射的处理函数
+    handler = TOOL_HANDLERS.get(block.name)
+    # 如果没有找到对应的处理函数，说明工具名称未知，返回错误信息
+    if not handler:
+        return f"Unknown tool: {block.name}"
+
+    # 3.执行工具调用
+    # 执行工具调用，捕获异常并返回错误信息
+    try:
+        # 执行工具调用，传入block.input作为参数，获取返回结果
+        output = str(handler(**block.input))
+    except Exception as exc:
+        output = f"Error: {type(exc).__name__}: {exc}"
+
+    # 4.处理结果
+    # 工具调用后触发 PostToolUse 钩子，可以用于日志记录、输出检查等
+    trigger_hooks("PostToolUse", block, output)
+
+    return output
+
+
+# -- 12.2 子 Agent 工具执行：使用绑定了身份和权限的成员 Handler --
+
+def _run_teammate_tool(name: str, block, handlers: dict) -> str:
+    """校验成员执行约束后，调用相应的工具处理函数。
+
+    输入：
+        name (str)：当前操作涉及的成员、服务、工具或工作流名称。
+        block：模型返回的工具调用块，包含工具名称与输入参数。
+        handlers (dict)：工具名称到处理函数的映射。
+
+    输出：
+        str：文本结果，可能是正常输出、状态摘要或当前实现返回的错误提示。
+
+    执行流程：
+        1. 调用 plan_gates.get，将结果保存到 gate。
+        2. 检查条件 block.name in {'bash', 'write_file', 'edit_file'}，按结果处理对应分支。
+        3. 调用 handlers.get，将结果保存到 handler。
+        4. 检查条件 not handler，按结果处理对应分支。
+        5. 条件满足时，返回 f'Unknown tool: {block.name}'，结束本次调用。
+        6. 调用 trigger_hooks('PreToolUse', block)。
+        7. 调用 str，将结果保存到 output。
+        8. 遇到 Exception 时进入对应 except 分支。
+        9. 调用 trigger_hooks('PostToolUse', block, output)。
+        10. 返回 output，结束本次调用。
+
+    注意：
+        只处理 except 中列出的异常；异常结果、重试或回退逻辑由对应分支决定。
+    """
+    gate = plan_gates.get(name, "not_required")
+    if block.name in {"bash", "write_file", "edit_file"}:
+        if gate != "approved":
+            if gate != "not_required":
+                return (
+                    f"Blocked: plan status is {gate}. Submit or revise the "
+                    "plan and wait for approval before changing the workspace."
+                )
+        blocked = check_permission(block, prompt_user=False)
+        if blocked:
+            return blocked
+    handler = handlers.get(block.name)
+    if not handler:
+        return f"Unknown tool: {block.name}"
+    trigger_hooks("PreToolUse", block, skip_permission=True)
+    try:
+        output = str(handler(**block.input))
+    except Exception as exc:
+        output = f"Error: {type(exc).__name__}: {exc}"
+    trigger_hooks("PostToolUse", block, output)
+    return output
+
+# endregion
+
+
+# region 13 Hooks 与权限检查
+# PreToolUse / PostToolUse 包围实际执行；队友也遵守已有审批和权限约束。
 
 HOOKS = {"UserPromptSubmit": [], "PreToolUse": [], "PostToolUse": [], "Stop": []}
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if="]
@@ -3700,35 +3819,12 @@ register_hook("Stop", summary_hook)
 
 
 # 执行工具调用，返回结果或错误信息
-def execute_tool(block) -> str:
-    # 1.执行前检查
-    # 工具调用前触发 PreToolUse 钩子，检查权限和日志
-    # 如果钩子返回非空结果，说明工具调用被阻止，直接返回阻止信息
-    # 什么情况下会阻止工具调用？例如 bash 命令包含危险操作，或者文件路径不在工作目录内
-    blocked = trigger_hooks("PreToolUse", block)
-    if blocked:
-        return str(blocked)
 
-    # 2.找到对应的处理函数
-    # 传入block 从block.name就能获取工具名称，从TOOL_HANDLERS中获取对应的映射的处理函数
-    handler = TOOL_HANDLERS.get(block.name)
-    # 如果没有找到对应的处理函数，说明工具名称未知，返回错误信息
-    if not handler:
-        return f"Unknown tool: {block.name}"
+# endregion
 
-    # 3.执行工具调用
-    # 执行工具调用，捕获异常并返回错误信息
-    try:
-        # 执行工具调用，传入block.input作为参数，获取返回结果
-        output = str(handler(**block.input))
-    except Exception as exc:
-        output = f"Error: {type(exc).__name__}: {exc}"
 
-    # 4.处理结果
-    # 工具调用后触发 PostToolUse 钩子，可以用于日志记录、输出检查等
-    trigger_hooks("PostToolUse", block, output)
-
-    return output
+# region 14 终端输入输出
+# 打印最后回复、读取用户输入，并响应团队邮箱唤醒事件。
 
 def print_last_assistant_message(history: list):
     if not history:
@@ -3810,28 +3906,33 @@ def wait_for_cli_event() -> tuple[str, str | None]:
                 return "quit", None
             return "user", line.rstrip("\n")
 
+# endregion
 
-# -- Agent Loop --
+
+# region 15 Lead Agent Loop
+# 模型请求 → tool_use → execute_tool → tool_result；没有工具调用则结束本轮。
+
+# 主 Agent 循环（沿用原来的 agent_loop）
 
 
 def agent_loop(messages: list):
     while True:
+
+
         #1.尝试给LLM发送消息 获得响应,如果出现异常，捕获异常并将错误信息添加到消息中，然后释放已完成的任务并触发停止钩子
         try:
-            #添加上下文压缩模块
-            # 每次模型请求前检查预算；压缩之后仍走原来的 tool_use / tool_result 循环。
-            # tools 也占上下文，因此必须和 system/messages 一起参与估算。
+            #上下文压缩模块
             context_manager.prepare(
                 messages=messages,
                 system=SYSTEM,
                 tools=TOOLS,
                 agent_name="lead",
             )
+            #给LLM发送消息 获得响应
             response = client.messages.create(
-                model=MODEL,
-                system=SYSTEM,
-                messages=messages,
-                # base_tools,task_tools,team_tools
+                model=MODEL,#使用什么模型
+                system=SYSTEM,#设定的系统提示词
+                messages=messages,#agent_loop收到的参数
                 tools=TOOLS,
                 max_tokens=MAX_OUTPUT_TOKENS,
             )
@@ -3853,10 +3954,11 @@ def agent_loop(messages: list):
             trigger_hooks("Stop", messages)
             return
 
+
         #2.将LLM的响应内容添加到消息中
         messages.append({"role": "assistant", "content": response.content})
-        
-        
+
+
         #3.检查是否有工具调用，如果有则执行工具调用，没有则结束循环
         #从LLM中提取工具调用块
         tool_calls = [block for block in response.content if block.type == "tool_use"]
@@ -3865,6 +3967,7 @@ def agent_loop(messages: list):
             release_completed_assignment("agent")
             trigger_hooks("Stop", messages)
             return
+
 
         #4.执行工具调用，并将结果添加到消息中
         results = []
@@ -3886,11 +3989,11 @@ def agent_loop(messages: list):
         #多个工具调用的结果会被合并为一个消息块，添加到消息中
         messages.append({"role": "user", "content": results})
 
+# endregion
 
 
-
-# -- [Team Framework] CLI configuration; the conversation still calls agent_loop --
-
+# region 16 main 启动入口
+# 解析启动参数、加载 .env 并进入交互；退出时协调关闭已启动的成员。
 
 def main() -> int:
     # Windows 重定向输出时可能使用西文编码；统一 UTF-8，避免中文提示导致启动失败。
@@ -3898,11 +4001,10 @@ def main() -> int:
         if hasattr(stream, 'reconfigure'):
             stream.reconfigure(encoding='utf-8', errors='replace')
     global client, MODEL, WORKDIR, TASKS_DIR, TASKS_ROOT, TASK_LOCK_PATH, context_manager
-    global MAILBOX_DIR, MAILBOX_ROOT, WORKTREES_DIR, WORKTREES_ROOT, SYSTEM, MAX_OUTPUT_TOKENS
+    global MAILBOX_DIR, MAILBOX_ROOT, WORKTREES_DIR, WORKTREES_ROOT, PROMPT_SECTIONS, SYSTEM, MAX_OUTPUT_TOKENS
     parser = argparse.ArgumentParser(
-        description="Configurable Multi-Agent Team Framework"
+        description="Multi-Agent Team Framework"
     )
-    parser.add_argument("--team-config", type=Path, help="团队配置 JSON；默认 team.json")
     parser.add_argument("request", nargs="?", help="可选的第一条需求；之后仍可继续对话")
     parser.add_argument("--env-file", type=Path, default=PROJECT_ROOT / ".env")
     parser.add_argument(
@@ -3921,10 +4023,8 @@ def main() -> int:
         MAX_OUTPUT_TOKENS = int(os.getenv("AGENT_MAX_OUTPUT_TOKENS", "4096"))
         if not 256 <= MAX_OUTPUT_TOKENS <= 16384:
             raise ValueError("AGENT_MAX_OUTPUT_TOKENS 应在 256～16384 之间")
-        #读取team.json 加入SYSTEM SYSTEM后续会加入messages中作为系统消息
-        selected_team = load_team_config(args.team_config)
     except (ValueError, OSError) as exc:
-        parser.error(f"团队/上下文配置错误：{exc}")
+        parser.error(f"上下文参数错误：{exc}")
     MODEL = os.getenv("MODEL_ID", "deepseek-flash").strip()
     deepseek_key = os.getenv("DEEPSEEK_API_KEY")
     if not MODEL or not deepseek_key:
@@ -3951,17 +4051,19 @@ def main() -> int:
     MAILBOX_ROOT = MAILBOX_DIR.resolve()
     WORKTREES_DIR = WORKDIR / ".worktrees"
     WORKTREES_ROOT = WORKTREES_DIR.resolve()
-    configure_team(selected_team)
+    # --workdir / .env 确定实际目录后，重建系统提示词，不再读取外部团队配置。
+    PROMPT_SECTIONS = build_prompt_sections()
+    SYSTEM = "\n\n".join(PROMPT_SECTIONS.values())
     fixed_cost = context_manager._request_tokens([], SYSTEM, TOOLS, MAX_OUTPUT_TOKENS)
     if context_manager.enabled and fixed_cost >= context_manager.max_tokens * context_manager.trigger_ratio:
         parser.error("system/tools/回复预留已达到压缩触发线，请增大 CONTEXT_MAX_TOKENS 或降低回复上限")
     if args.check_config:
-        print(f"Configuration OK: {TEAM_CONFIG['name']}; members={','.join(TEAM_MEMBERS)}; no API request sent.")
+        print(f"Configuration OK: {TEAM_NAME}; members=dynamic (initially none); no API request sent.")
         return 0
     WORKDIR.mkdir(parents=True, exist_ok=True)
     client = DeepSeekClient(api_key=deepseek_key, timeout=120)
-    print(f"Multi-Agent Team Framework — {TEAM_CONFIG['name']} / {MODEL}")
-    print(f"Members: {', '.join(TEAM_MEMBERS)}; output limit: {MAX_OUTPUT_TOKENS}")
+    print(f"{TEAM_NAME} / {MODEL}")
+    print(f"Members: chosen dynamically by Lead; output limit: {MAX_OUTPUT_TOKENS}")
     print(f"Context: budget={context_manager.max_tokens}, trigger={context_manager.trigger_ratio:.0%}, target={context_manager.target_ratio:.0%}")
     print(f"Workspace: {WORKDIR}")
     print("输入需求并回车发送，q 退出。团队事件会自动唤醒 Lead。\n")
@@ -4015,3 +4117,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+# endregion

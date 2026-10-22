@@ -1,224 +1,171 @@
-# Configurable Multi-Agent Team Framework
+# Multi-Agent Team Framework
 
-一个可配置的多 Agent 团队框架原型。用户提出目标，Lead 理解需求、拆解任务、创建成员、协调反馈并检查交付。成员通过共享文件任务板与 MessageBus 协作，各自保留独立的 Agent Loop 和消息历史。
+**简体中文** | [English](README.en.md)
 
-核心实现仍集中在带中文注释的 [`main.py`](main.py)。团队名称、成员数量、身份、职责、工作区工具和交付条件由 JSON 配置决定。游戏开发是其中一个示例，也可以配置成调研写作团队或其他工作团队。
+一个便于阅读、修改和实验的 Python 多 Agent 框架，沿用 learn-claude-code 风格的 Agent Loop。**全部实现放在带详细中文注释的 `main.py` 中**，通过 16 个可折叠分区区分模块。
 
-> 当前已实现自动上下文压缩；持久 Memory 和 MCP 尚未实现。框架不是操作系统沙箱，产物质量与报告真实性需要实际核验。
+用户提出目标，Lead 可以直接使用工具完成工作，也可以按需创建子 Agent，自行决定人数、名字和职责。没有预设岗位，也不需要团队配置 JSON。
 
-## 架构
+## 已实现的能力
 
-```mermaid
-flowchart TD
-    Config[团队 JSON：成员、职责、工具、交付政策] --> Lead[Lead Agent]
-    User[用户目标] --> Lead
-    Lead --> A[成员 A：独立 Loop / 上下文]
-    Lead --> B[成员 B：独立 Loop / 上下文]
-    Lead --> C[更多已配置成员]
-    Lead <--> Store[TaskStore：任务 / 依赖 / 分派 / 状态]
-    A <--> Store
-    B <--> Store
-    C <--> Store
-    Lead <--> Bus[MessageBus：JSONL 邮箱 / 线程通知]
-    A <--> Bus
-    B <--> Bus
-    C <--> Bus
-    Lead --> Delivery[按配置检查交付文件和质量报告]
-```
+- **动态组队**：子 Agent 在独立线程中运行，各自拥有消息历史与模型循环。
+- **共享任务板**：创建任务、建立依赖、派发、认领和完成，使用文件锁协调状态。
+- **消息协作**：MessageBus 使用 JSONL 邮箱与线程通知传递任务反馈、审批和关闭请求。
+- **工具执行**：文件读写、Shell、任务与团队操作；子 Agent 可进一步限制工作区工具。
+- **上下文压缩**：请求前估算预算，缩短旧工具结果，必要时生成滚动摘要。
+- **协作控制**：可选计划审批、Git worktree、产物及可选质量报告检查。
 
-模型仍通过原来的循环调用 Python 工具：
-
-```text
-用户输入 / 团队事件
-  → 压缩预算检查
-  → client.messages.create
-  → tool_use → 执行工具 → tool_result
-  → 下一次请求，直到本轮结束
-```
-
-Lead 按需启动配置中的成员，并非每次启动所有人。成员 `name` 是任务与邮箱身份；`role` 是职责标签，两者可以不同，多个成员可以使用相同 role。
+持久 Memory 和 MCP 尚未实现。当前模型客户端使用 DeepSeek，通过 Anthropic SDK 调用兼容消息接口。
 
 ## 快速开始
 
-需要 Python 3.10+ 和可用的 DeepSeek API 密钥及额度。下面使用 Windows PowerShell：
+需要 Python 3.10+，以及可用的 DeepSeek API 密钥和额度。先激活你自己选择的 Python 环境；项目不会指定解释器路径或自动切换环境。
+
+下面使用 Windows PowerShell：
 
 ```powershell
-# 仓库地址暂沿用原项目名称；本地已有项目也无需改名
-git clone https://github.com/hihihiddssa/game-company-agent.git
-cd game-company-agent
-# 先激活你自己选择的 Python 环境（venv、Conda 等）
+git clone https://github.com/hihihiddssa/multi-agent-team-framework.git
+cd multi-agent-team-framework
 python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-在 `.env` 中填写：
+在本地 `.env` 中填写密钥和模型：
 
 ```dotenv
 DEEPSEEK_API_KEY=your_deepseek_api_key
 MODEL_ID=deepseek-flash
 ```
 
-实际请求发往 `https://api.deepseek.com/anthropic`，通过 Anthropic SDK 使用兼容消息协议，关闭深度思考。真实 `.env` 已被 Git 忽略。
-
 ```powershell
+# 填写环境变量后检查启动参数，不发送 API 请求
 python main.py --check-config
-python main.py
-```
 
-出现 `team >>` 后输入需求。输入 `q` / `exit`，或按 `Ctrl+C` 退出。`--check-api` 只读模型列表验证接口，不生成文本。
-
-运行环境由你自己选择，项目不指定 Python 路径，也不自动切换环境。
-
-- **终端**：先激活你选择的 venv / Conda 环境，再运行 `python main.py`。`python -m pip install -r requirements.txt` 会将依赖安装到这个环境。
-- **VS Code**：按 `Ctrl+Shift+P`，执行 `Python: Select Interpreter`，选择你想用的环境。运行按钮和调试使用这个解释器；已有终端可关闭后重新打开以激活新选择的环境。
-
-可以运行 `python -c "import sys; print(sys.executable)"`，确认当前终端实际使用的解释器。`.env` 保存 API 密钥和应用参数，与 Python 虚拟环境是两回事。
-
-## 切换团队
-
-```powershell
-# 默认通用团队：planner、builder、reviewer
+# 启动交互；输入 q / exit 或 Ctrl+C 退出
 python main.py
 
-# 保留原游戏公司的使用方式，建议为新团队选择独立工作区
-python main.py --team-config examples/game-team.json --workdir workspace/game-project
-
-# 调研写作：analyst、writer、editor
-python main.py --team-config examples/research-team.json --workdir workspace/research-project
+# 为新任务使用独立产物目录
+python main.py --workdir workspace/counter-demo
 ```
 
-配置优先级：`--team-config` → `.env` 中 `TEAM_CONFIG` → 项目 `team.json`。未指定配置且默认文件不存在时，使用内置通用团队；显式指定的文件找不到时会报错。运行中的团队不支持热切换配置。
+实际模型请求发往 `https://api.deepseek.com/anthropic`。`--check-api` 会访问模型列表验证接口；不会生成文本。真实 `.env`、运行产物和缓存均被 Git 忽略。
 
-调研示例只包含本地文件工具，没有联网搜索或 MCP 工具。业务运行所需的 Node.js、浏览器等也由具体任务决定，不由 Python 依赖自动提供。
+在 VS Code 中，通过 **Python: Select Interpreter** 选择已安装依赖的环境。可运行 `python -c "import sys; print(sys.executable)"` 确认终端解释器；`.env` 与 Python 虚拟环境是两回事。
 
-### 配置格式
+## 运行流程
 
-```json
-{
-  "name": "Document Team",
-  "lead_prompt": "组织成员完成用户的文档任务，使用中文沟通。",
-  "members": [
-    {
-      "name": "author",
-      "role": "writer",
-      "instructions": "将报告写入 reports/final.md，并注明依据与限制。",
-      "tools": ["read_file", "write_file", "edit_file", "glob"]
-    },
-    {
-      "name": "editor",
-      "role": "reviewer",
-      "instructions": "只读取文件检查并反馈问题。",
-      "tools": ["read_file", "glob"]
-    }
-  ],
-  "delivery": {
-    "required_members": ["author", "editor"],
-    "required_files": ["reports/final.md"],
-    "report_path": null,
-    "report_owner": null
-  }
-}
+```mermaid
+flowchart TD
+    Input[用户消息或团队事件] --> Lead[Lead Agent Loop]
+    Lead --> Model[检查上下文预算并请求模型]
+    Model --> Decision{有工具调用?}
+    Decision -->|有| Tools[权限检查和工具执行]
+    Tools --> Results[tool_result 加入 messages]
+    Results --> Model
+    Decision -->|无| Reply[结束本轮并等待新消息]
+    Tools -->|按需创建| Child[子 Agent 独立循环]
+    Child <--> Tasks[共享 TaskStore]
+    Lead <--> Tasks
+    Child --> Bus[MessageBus]
+    Bus --> Input
 ```
 
-`members` 支持 1～32 名成员，名字不能重复或使用保留名 `lead` / `agent`。`instructions` 是职责说明；`tools` 控制工作区工具，省略时开放全部五种基础工具，空列表表示不开放工作区工具。
+同一条模型回复中的工具调用目前按顺序执行；子 Agent 线程可以并发工作。结束一轮回复不会退出程序或关闭子 Agent。
 
-任务认领、完成、消息和计划提交工具始终保留。工具声明和实际处理函数同时按配置过滤；配置只读成员不会拥有 `write_file`、`edit_file` 或 `bash` 处理函数。允许 `bash` 的成员仍可用 Shell 修改文件，因此该配置不是 OS 级权限隔离。
-
-`delivery` 可以省略，默认没有固定成员和固定文件要求，也不强制质量报告。`accept_delivery(artifacts=[...])` 始终要求所有任务完成，且至少有一个真实产物文件。
-
-### 可选质量报告
-
-设置 `report_path` 时必须指定 `report_owner`，例如：
-
-```json
-"delivery": {
-  "required_members": ["builder", "reviewer"],
-  "required_files": ["docs/result.md"],
-  "report_path": "reports/qa.json",
-  "report_owner": "reviewer"
-}
-```
-
-报告引用该成员拥有且完成的任务，结构如下：
-
-```json
-{
-  "task_id": "实际生成的复核任务ID",
-  "passed": true,
-  "issues": [],
-  "checks": [
-    {"name": "检查名称", "command": "实际执行的命令", "returncode": 0, "output": "结果文本"}
-  ]
-}
-```
-
-框架检查报告字段、任务归属、检查退出码和未解决问题；兼容旧游戏报告的 `bugs` 字段。报告路径来自配置，不能在工具参数中换一个路径绕过政策。文件存在和结构通过不代表内容一定正确，也不证明报告中的命令确实被执行。
-
-## 工具分层与阅读入口
-
-| 集合 | 用途 |
-| --- | --- |
-| `BASE_TOOLS` | Shell、文件读写编辑、文件匹配 |
-| `TASK_TOOLS` | 创建、依赖、认领、完成与 `assign_task` |
-| `TEAM_TOOLS` | 创建成员、消息、计划审批和关闭 |
-| `DELIVERY_TOOLS` | 根据配置执行 `accept_delivery` |
-
-`STUDIO_TOOLS` 和 `accept_game` 已由通用任务/交付工具替代。成员可见工具由 `teammate_tools()` 根据配置生成；Lead 使用 `TOOLS`。验收规则扩展在 `run_accept_delivery()` 中完成。
-
-建议先读 `main()` → `load_team_config()` / `configure_team()` → `agent_loop()` → `TeammateRuntime`，再读 TaskStore、MessageBus 和工具处理函数。相对原教学代码的位置见 [`SOURCE_MAP.md`](SOURCE_MAP.md)。
-
-## 上下文压缩与参数
-
-每次模型请求前调用 `context_manager.prepare()`。超出触发线时，先缩短旧的 `read_file` / `bash` / `glob` 大段输出；仍高于压缩目标时，对旧历史进行滚动摘要。
-
-保留第一条需求、最近消息及完整的工具调用/结果配对。操作先在副本中进行，摘要失败或最终超过总预算时不替换原历史。摘要仅存在当前进程，任务和文件状态仍以任务板和工作区为准。
-
-新的默认值是本框架的调优起点，不是模型官方上下文限制，也不能保证适合所有任务：
-
-| 变量 | 原默认值 | 新默认值 | 原因 |
-| --- | --- | --- | --- |
-| `CONTEXT_MAX_TOKENS` | 32000 | 48000 | 给协作历史和工具定义更多空间 |
-| `CONTEXT_TRIGGER_RATIO` | 无，达到总预算才处理 | 0.8 | 提前触发，默认估算总请求超过 38400 时处理 |
-| `CONTEXT_TARGET_RATIO` | 无 | 0.55 | 目标降到约 26400，留出后续增长空间 |
-| `CONTEXT_KEEP_RECENT` | 6 | 8 | 多保留最近工作细节，遇到完整调用链可保留更多 |
-| `CONTEXT_KEEP_TOOL_RESULTS` | 3 | 3 | 最近的工具结果保持完整 |
-| `CONTEXT_SUMMARY_TOKENS` | 1200 | 2000 | 为任务 ID、约束、路径和下一步留更多摘要空间 |
-| `CONTEXT_TOOL_RESULT_CHARS` | 写死头尾各 1000 | 2400 | 旧输出保留文本长度可配置，另外附省略提示 |
-| `AGENT_MAX_OUTPUT_TOKENS` | 写死 8000 | 4096 | 实际回复上限与压缩预算统一，避免预留两处不一致 |
-
-在 `.env` 中覆盖上述变量，重启生效。`CONTEXT_COMPRESSION_ENABLED=false` 可关闭压缩。总预算包括 system、工具定义、消息、回复预留及余量；按 UTF-8 字节数 / 3 估算，服务端实际 token 计数可能不同。
-
-单次需要输出较长代码或文档时，可把 `AGENT_MAX_OUTPUT_TOKENS` 调到 `8192`；回复预留会同步增加。原 `.env` 中等于旧默认值的 32000 / 6 / 1200 在本次升级时会迁移到新默认值，其他已有自定义值保留。
-
-目标比例是期望值，保留最近历史优先，压缩后可能高于目标。原始需求、近期工具结果或 system 本身太大时会明确报错，需要增加预算或缩小输入。模型摘要会增加 API 请求且可能遗漏细节；较大的预算也会增加普通请求的输入成本。
-
-阅读顺序仍为 `prepare()` → `_micro_compact()` → `_find_cut()` → `_summarize()`。每个 Agent 压缩自己的历史，共享的对象只保存配置。
-
-## 文件和运行状态
+需要跟踪委派任务时，通常使用：
 
 ```text
-main.py                       # 唯一核心 Python 文件
-team.json                     # 默认通用团队
-examples/game-team.json        # 游戏团队示例
-examples/research-team.json    # 本地调研写作团队示例
-.env.example                  # 密钥与运行参数模板
-workspace/                    # 按需创建，不上传 Git
-  .tasks/                     # 共享任务记录
-  .mailboxes/                 # JSONL 消息邮箱
-  delivery.json               # 通用交付记录
-  ...                         # 配置与任务决定的其他产物
+create_task → 必要的 update_task 依赖
+            → assign_task(task_id, 自选成员名)
+            → spawn_teammate(name, role, prompt, task_id)
 ```
 
-`.env`、`workspace/`、本地归档 `test/` 和依赖缓存不上传。使用 `--workdir` 或 `TEAM_WORKDIR` 指定独立目录；原 `GAME_STUDIO_WORKDIR` 仍作为兼容项保留。切换团队时建议换工作目录，旧任务不会自动迁移到新成员表。
+创建时会自动认领已派发、依赖就绪的初始任务，不需要子 Agent 重复 claim。依赖未就绪时省略 spawn 的 `task_id`，成员空闲后会自动领取派发给自己的就绪任务。子 Agent 使用文件和 Shell 工具前必须认领任务。
 
-任务与邮箱落盘，但聊天历史、摘要和线程不会在重启后自动恢复。Shell 默认非交互，报告等待进度并在超时后尝试终止进程树。现阶段建议在专用目录运行并检查 Agent 命令。
+`complete_task` 只更新任务状态，随后仍会进入模型循环处理结果；成员最终报告结果后进入空闲状态，等待消息或新任务。Lead 通过 `request_shutdown` 请求它退出。
 
-## 后续计划与许可
+## 工具与阅读入口
 
-- [x] 可配置成员、职责、工作区工具和交付政策。
-- [x] 通用任务派发、共享任务板、MessageBus 与独立 Agent Loop。
-- [x] 自动上下文压缩与可调预算。
-- [ ] 持久 Memory。
-- [ ] MCP Server 接入。
+| 对象 | 用途 |
+| --- | --- |
+| `BASE_TOOLS` | `bash`、`read_file`、`write_file`、`edit_file`、`glob` |
+| `TASK_TOOLS` | 创建、依赖、列表、详情、认领、完成与派发任务 |
+| `TEAM_TOOLS` | 动态创建成员、成员列表、消息、计划审批、关闭和 worktree |
+| `DELIVERY_TOOLS` | `accept_delivery` 检查产物、已有任务和可选质量报告 |
+| `TOOLS` | 上述四组定义合并后的 Lead 工具集合，传给模型 |
+| `TOOL_HANDLERS` | 工具名到 Python 执行函数的映射 |
+| `TEAMMATE_TOOLS` | 子 Agent 专用集合，额外包含 `submit_plan`，再按成员权限筛选 |
 
-改编自 **learn-claude-code s13** 的团队结构，参考 s08 的压缩思路；原项目 MIT 许可保留在 [`LICENSE`](LICENSE) 中。模型请求使用 [DeepSeek Anthropic 兼容接口](https://api-docs.deepseek.com/guides/anthropic_api/)。
+子 Agent 不具备创建成员、创建任务或验收交付的工具。`TEAMMATE_TOOLS` 复用了部分 Lead 工具定义，因此不会再次拼入 `TOOLS`。
+
+建议阅读顺序：`main()` → `agent_loop()` → `execute_tool()` → `TOOL_HANDLERS` → `run_*()`；然后阅读 `TeammateRuntime.work()` 和 `spawn_teammate_thread()`。
+
+常用分区：04 提示词与设置、05 任务板、08 消息与协议、10 工具实现、11 子 Agent 生命周期、12 工具定义与分发、15 Lead 循环。文件顶部有完整目录，VS Code 支持折叠 `# region`。与原教学代码的对应关系见 [SOURCE_MAP.md](SOURCE_MAP.md)。
+
+## 修改行为与权限
+
+直接编辑 `main.py` 第 04 节，重启后生效：
+
+| 设置 | 作用 |
+| --- | --- |
+| `TEAM_NAME` | 显示名称 |
+| `LEAD_PROMPT` | Lead 的行为、范围与分工原则 |
+| `TEAMMATE_PROMPT` | 子 Agent 共用约束；具体职责来自创建时的 role/prompt |
+| `TEAMMATE_ALLOWED_TOOLS` | 子 Agent 工作区工具权限上限 |
+| `DELIVERY_REQUIRED_FILES` | 必需产物列表，默认 `[]` |
+| `QUALITY_REPORT_PATH` | 可选质量报告路径，默认 `None` |
+
+创建子 Agent 时的 `tools` 参数只能进一步缩小权限，不能越过上限。`tools=[]` 仍保留任务、消息和计划工具；Lead 工具不受该上限限制。名字、职责和人数由模型决定，默认提示词要求简单任务直接完成、只做最小必要工作。
+
+`accept_delivery` 至少需要一个真实产物文件，不要求创建子 Agent 或任务；若有任务，必须全部完成。启用质量报告时，报告须引用实际执行者拥有且完成的任务，并包含 `passed: true`、空 `issues` 和成功命令的 `checks`。执行者可以是 Lead 或动态成员。
+
+## 上下文与 Token
+
+在 `.env` 中修改，默认值如下：
+
+| 变量 | 默认值 |
+| --- | --- |
+| `AGENT_MAX_OUTPUT_TOKENS` | `4096` |
+| `CONTEXT_COMPRESSION_ENABLED` | `true` |
+| `CONTEXT_MAX_TOKENS` | `48000` |
+| `CONTEXT_TRIGGER_RATIO` | `0.8` |
+| `CONTEXT_TARGET_RATIO` | `0.55` |
+| `CONTEXT_KEEP_RECENT` | `8` |
+| `CONTEXT_KEEP_TOOL_RESULTS` | `3` |
+| `CONTEXT_SUMMARY_TOKENS` | `2000` |
+| `CONTEXT_TOOL_RESULT_CHARS` | `2400` |
+
+预算包含 system、工具定义、历史、回复预留与协议余量，按 UTF-8 字节估算，不是服务端精确 Token 数。先缩短旧工具输出，再按需请求模型生成摘要；保留近期消息及完整工具调用/结果配对。摘要只属于各 Agent 当前进程，失败时不替换原历史。
+
+终端会打印每次模型请求的耗时、输入、缓存读取和输出用量。压缩控制的是单次请求的历史大小，**不是整个任务的 Token 或请求次数硬上限**；摘要本身也会消耗 API 额度。
+
+## 小规模协作测试
+
+启动后发送：
+
+> 请创建两个子 Agent 协作，在当前工作区的 collab-test/ 中制作一个单文件 index.html 计数器页面，支持加一、减一和重置；一人实现、一人独立检查，通过任务工具设置依赖并派发任务，检查结果用 send_message 告知 Lead，通过后验收交付并关闭成员，全程不安装依赖、不新增文档或测试框架、不轮询状态，最后简短汇报文件位置和实际检查结果。
+
+路径相对于当前工作区。没有实际打开浏览器时，不应声称做过浏览器测试。
+
+## 文件、限制与后续计划
+
+```text
+main.py          # 全部实现和16个可折叠分区，保留详细中文注释
+README.md        # 中文说明
+README.en.md     # English documentation
+SOURCE_MAP.md    # 教学代码对应关系
+.env.example     # 环境变量模板
+workspace/       # 按需创建，不上传 Git
+  .tasks/        # JSON 任务记录
+  .mailboxes/    # JSONL 邮箱
+  delivery.json  # 交付记录
+```
+
+- 工作目录不是 OS 沙箱；允许 Shell 就可以启动其他命令。Windows 的 `bash` 工具实际运行 CMD 语法。
+- 任务与邮箱落盘；聊天历史、摘要和成员线程不会在重启后自动恢复。新任务建议使用独立工作区。
+- 交付检查验证文件和报告结构，不证明报告中的命令实际执行过，也不保证产物质量。
+- 持久 Memory、MCP 和任务级请求/Token 硬预算尚未实现。
+
+## 来源与许可
+
+改编自 **learn-claude-code s13** 的工具循环与团队结构，压缩思路参考 s08；保留原项目 MIT 许可和版权声明，详见 [LICENSE](LICENSE)。
