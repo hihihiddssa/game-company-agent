@@ -125,7 +125,7 @@ create_task → 必要的 update_task 依赖
 
 | 变量 | 默认值 |
 | --- | --- |
-| `AGENT_MAX_OUTPUT_TOKENS` | `4096` |
+| `CONTEXT_OUTPUT_RESERVE` | `4096` |
 | `CONTEXT_COMPRESSION_ENABLED` | `true` |
 | `CONTEXT_MAX_TOKENS` | `48000` |
 | `CONTEXT_TRIGGER_RATIO` | `0.8` |
@@ -135,7 +135,9 @@ create_task → 必要的 update_task 依赖
 | `CONTEXT_SUMMARY_TOKENS` | `2000` |
 | `CONTEXT_TOOL_RESULT_CHARS` | `2400` |
 
-预算包含 system、工具定义、历史、回复预留与协议余量，按 UTF-8 字节估算，不是服务端精确 Token 数。先缩短旧工具输出，再按需请求模型生成摘要；保留近期消息及完整工具调用/结果配对。摘要只属于各 Agent 当前进程，失败时不替换原历史。
+普通 Lead / 子 Agent 不再设置应用层低输出上限：SDK 必须填写 `max_tokens`，因此客户端使用 [DeepSeek 官方当前最大输出](https://api-docs.deepseek.com/quick_start/pricing/) 384K（393216 tokens）；这不是无限输出，也不要求模型写满。旧 `AGENT_MAX_OUTPUT_TOKENS` 不再生效。
+
+`CONTEXT_OUTPUT_RESERVE` 仅是压缩估算的预留，**不会限制实际输出**；摘要专用的 `CONTEXT_SUMMARY_TOKENS` 仍保留，用于保持交接摘要简短。预算包含 system、工具定义、历史、回复预留与协议余量，按 UTF-8 字节估算，不是服务端精确 Token 数。先缩短旧工具输出，再按需请求模型生成摘要；保留近期消息及完整工具调用/结果配对。摘要只属于各 Agent 当前进程，失败时不替换原历史。
 
 终端会打印每次模型请求的耗时、输入、缓存读取和输出用量。压缩控制的是单次请求的历史大小，**不是整个任务的 Token 或请求次数硬上限**；摘要本身也会消耗 API 额度。
 

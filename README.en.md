@@ -118,7 +118,7 @@ Configure these in `.env`; defaults:
 
 | Variable | Default |
 | --- | --- |
-| `AGENT_MAX_OUTPUT_TOKENS` | `4096` |
+| `CONTEXT_OUTPUT_RESERVE` | `4096` |
 | `CONTEXT_COMPRESSION_ENABLED` | `true` |
 | `CONTEXT_MAX_TOKENS` | `48000` |
 | `CONTEXT_TRIGGER_RATIO` | `0.8` |
@@ -128,7 +128,9 @@ Configure these in `.env`; defaults:
 | `CONTEXT_SUMMARY_TOKENS` | `2000` |
 | `CONTEXT_TOOL_RESULT_CHARS` | `2400` |
 
-The budget includes system text, tool schemas, history, output reservation and protocol allowance. It is estimated from UTF-8 bytes, not an exact provider token count. Older tool output is trimmed first; model-generated rolling summaries are used if needed. Recent messages and complete tool-call/result pairs are preserved. Summaries stay in the owning agent's current process; failure leaves the original history intact.
+Normal Lead/teammate requests no longer have a low application output cap. The SDK requires `max_tokens`, so the client supplies [DeepSeek's current provider maximum](https://api-docs.deepseek.com/quick_start/pricing/): 384K (393216 tokens). This is not unlimited output and does not require the model to fill the allowance. The old `AGENT_MAX_OUTPUT_TOKENS` setting is ignored.
+
+`CONTEXT_OUTPUT_RESERVE` is only a compaction estimate; **it does not cap actual output**. The summary-only `CONTEXT_SUMMARY_TOKENS` remains to keep handoff summaries concise. The budget includes system text, tool schemas, history, output reservation and protocol allowance. It is estimated from UTF-8 bytes, not an exact provider token count. Older tool output is trimmed first; model-generated rolling summaries are used if needed. Recent messages and complete tool-call/result pairs are preserved. Summaries stay in the owning agent's current process; failure leaves the original history intact.
 
 The terminal logs each model request's duration, input, cache-read and output usage. Compaction limits request history size, **not total task tokens or the number of model requests**. Summarization also consumes API quota.
 

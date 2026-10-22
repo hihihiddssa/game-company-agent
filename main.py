@@ -80,6 +80,13 @@ class DeepSeekClient:
     Lead 和动态创建的队友共用此客户端，各自维护独立的 messages 历史。
     """
 
+    # SDK 必填 max_tokens，无法用“省略参数”表达不限长。
+    # 普通 Agent 请求使用提供方当前的最大输出，不再额外设置 4096 等低上限。
+    # DeepSeek 当前两款公开模型最大输出为 384K = 393216 tokens（2026-10-22）。
+    # 官方依据：https://api-docs.deepseek.com/quick_start/pricing/
+    # 这只是接口允许的最大值，不会强迫模型输出这么长，也不是计费预扣额度。
+    PROVIDER_OUTPUT_CEILING = 393216
+
     def __init__(self, api_key: str, timeout: float = 120):
         if not api_key:
             raise ValueError("Missing DEEPSEEK_API_KEY")
@@ -97,11 +104,14 @@ class DeepSeekClient:
                              "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
 
     def create(self, **kwargs):
-        """原封不动传递 system、messages 和 tools，仅固定关闭深度思考。
+        """传递 system、messages 和 tools，补齐接口输出参数并关闭深度思考。
 
         回复仍是原代码使用的 text/tool_use 内容块，无需协议转换。
         不额外排队限速；超时或余额不足直接报告，避免后台反复请求。
         """
+        # Lead / 子 Agent 不再传业务输出上限，由这一层补齐 SDK 必填参数。
+        # 压缩摘要会显式传入自己的 summary_tokens，继续保持摘要简短。
+        kwargs.setdefault("max_tokens", self.PROVIDER_OUTPUT_CEILING)
         kwargs["thinking"] = {"type": "disabled"}
         started = time.monotonic()
         try:
@@ -117,11 +127,11 @@ class DeepSeekClient:
             print(f"[api] #{request_number} {agent}: {time.monotonic() - started:.1f}s "
                   f"input={values['input_tokens']} cached={values['cache_read_input_tokens']} "
                   f"output={values['output_tokens']}", flush=True)
-            # 4096 是单次输出上限，不是实际消耗。截断的工具参数不能继续执行，
-            # 否则可能表现为 write_file({})，让模型反复修复无效调用。
+            # 服务端仍可能因模型输出/上下文限制截断回复；不执行不完整工具参数。
+            # 应用层取消低上限，并不意味着提供方可以无限输出。
             if response.stop_reason == "max_tokens":
-                raise RuntimeError("模型回复达到输出上限，可能包含不完整工具参数；已停止本轮。"
-                                   "请缩小单次输出或提高 AGENT_MAX_OUTPUT_TOKENS。")
+                raise RuntimeError("模型回复被服务端输出/上下文限制截断，可能包含不完整工具参数；"
+                                   "已停止本轮，请分批生成或减少本次输入。")
             return response
         except Exception as exc:
             raise RuntimeError(str(exc).replace(self._api_key, "[REDACTED]")) from None
@@ -192,7 +202,7 @@ class ContextManager:
     '''
     def __init__(self, enabled=True, max_tokens=48000, keep_recent=8,
                  keep_tool_results=3, summary_tokens=2000, trigger_ratio=0.8,
-                 target_ratio=0.55, tool_result_chars=2400):
+                 target_ratio=0.55, tool_result_chars=2400, output_reserve=4096):
         # max_tokens 是本程序的保守请求预算，不是宣称模型只有这么长的上下文。
         # 它同时计入 system、tools、messages、预留回复空间和一点协议余量。
         if max_tokens < 8192:
@@ -202,6 +212,11 @@ class ContextManager:
         if not 256 <= summary_tokens <= 4096 or summary_tokens + 2048 >= max_tokens:
             raise ValueError("CONTEXT_SUMMARY_TOKENS 应在 256～4096 之间且小于请求预算")
         self.enabled = enabled
+        # 这只是压缩估算中的回复预留，不会传给 API 限制 Agent 输出。
+        # 不用提供方的 393216 上限作预留，否则默认 48000 预算启动就会超标。
+        if type(output_reserve) is not int or not 0 <= output_reserve < max_tokens:
+            raise ValueError("CONTEXT_OUTPUT_RESERVE 应为非负整数且小于 CONTEXT_MAX_TOKENS")
+        self.output_reserve = output_reserve
         self.max_tokens = max_tokens
         self.keep_recent = keep_recent
         self.keep_tool_results = keep_tool_results
@@ -229,6 +244,7 @@ class ContextManager:
             trigger_ratio=float(os.getenv("CONTEXT_TRIGGER_RATIO", "0.8")),
             target_ratio=float(os.getenv("CONTEXT_TARGET_RATIO", "0.55")),
             tool_result_chars=int(os.getenv("CONTEXT_TOOL_RESULT_CHARS", "2400")),
+            output_reserve=int(os.getenv("CONTEXT_OUTPUT_RESERVE", "4096")),
         )
 
     @staticmethod
@@ -380,8 +396,8 @@ class ContextManager:
         第一条需求和最近 keep_recent 条消息保留原文；system、tools 从未改写。
         任务文件、实际代码、邮箱、审批状态也不在本类的修改范围内。
         """
-        # 回复预留和真正请求的 max_tokens 共用一个配置，不再固定预留 8000。
-        output_tokens = MAX_OUTPUT_TOKENS if output_tokens is None else output_tokens
+        # 估算用的回复预留与接口输出上限分开：这里只决定何时压缩，不截断输出。
+        output_tokens = self.output_reserve if output_tokens is None else output_tokens
         trigger = int(self.max_tokens * self.trigger_ratio)
         target = int(self.max_tokens * self.target_ratio)
         tools = tools or []
@@ -487,7 +503,6 @@ QUALITY_REPORT_PATH = None
 # 这是运行时注册表，不是预设名单。仅成功创建的子 Agent 才在这里登记。
 # 成员退出后保留元数据，便于核对已完成任务的归属；重启程序后从空表开始。
 TEAM_MEMBERS = {}
-MAX_OUTPUT_TOKENS = 4096  # 真正的模型回复上限，同时用于压缩预算，避免两处数字不一致。
 
 
 def validate_workspace_tools(tools):
@@ -3108,7 +3123,6 @@ class TeammateRuntime:
                 messages=self.messages,
                 # 只能使用teammate工具集，不能使用其他工具
                 tools=self.tools,
-                max_tokens=MAX_OUTPUT_TOKENS,
             )
         except Exception as exc:
             BUS.send(self.name, "lead", f"{type(exc).__name__}: {exc}", "error")
@@ -3934,7 +3948,6 @@ def agent_loop(messages: list):
                 system=SYSTEM,#设定的系统提示词
                 messages=messages,#agent_loop收到的参数
                 tools=TOOLS,
-                max_tokens=MAX_OUTPUT_TOKENS,
             )
         except Exception as exc:
             messages.append(
@@ -4001,7 +4014,7 @@ def main() -> int:
         if hasattr(stream, 'reconfigure'):
             stream.reconfigure(encoding='utf-8', errors='replace')
     global client, MODEL, WORKDIR, TASKS_DIR, TASKS_ROOT, TASK_LOCK_PATH, context_manager
-    global MAILBOX_DIR, MAILBOX_ROOT, WORKTREES_DIR, WORKTREES_ROOT, PROMPT_SECTIONS, SYSTEM, MAX_OUTPUT_TOKENS
+    global MAILBOX_DIR, MAILBOX_ROOT, WORKTREES_DIR, WORKTREES_ROOT, PROMPT_SECTIONS, SYSTEM
     parser = argparse.ArgumentParser(
         description="Multi-Agent Team Framework"
     )
@@ -4020,9 +4033,6 @@ def main() -> int:
     # 必须在 load_dotenv 之后读取；否则 .env 的阈值设置不会生效。
     try:
         context_manager = ContextManager.from_env()
-        MAX_OUTPUT_TOKENS = int(os.getenv("AGENT_MAX_OUTPUT_TOKENS", "4096"))
-        if not 256 <= MAX_OUTPUT_TOKENS <= 16384:
-            raise ValueError("AGENT_MAX_OUTPUT_TOKENS 应在 256～16384 之间")
     except (ValueError, OSError) as exc:
         parser.error(f"上下文参数错误：{exc}")
     MODEL = os.getenv("MODEL_ID", "deepseek-flash").strip()
@@ -4054,16 +4064,16 @@ def main() -> int:
     # --workdir / .env 确定实际目录后，重建系统提示词，不再读取外部团队配置。
     PROMPT_SECTIONS = build_prompt_sections()
     SYSTEM = "\n\n".join(PROMPT_SECTIONS.values())
-    fixed_cost = context_manager._request_tokens([], SYSTEM, TOOLS, MAX_OUTPUT_TOKENS)
+    fixed_cost = context_manager._request_tokens([], SYSTEM, TOOLS, context_manager.output_reserve)
     if context_manager.enabled and fixed_cost >= context_manager.max_tokens * context_manager.trigger_ratio:
-        parser.error("system/tools/回复预留已达到压缩触发线，请增大 CONTEXT_MAX_TOKENS 或降低回复上限")
+        parser.error("system/tools/回复预留已达到压缩触发线，请增大 CONTEXT_MAX_TOKENS 或降低 CONTEXT_OUTPUT_RESERVE")
     if args.check_config:
         print(f"Configuration OK: {TEAM_NAME}; members=dynamic (initially none); no API request sent.")
         return 0
     WORKDIR.mkdir(parents=True, exist_ok=True)
     client = DeepSeekClient(api_key=deepseek_key, timeout=120)
     print(f"{TEAM_NAME} / {MODEL}")
-    print(f"Members: chosen dynamically by Lead; output limit: {MAX_OUTPUT_TOKENS}")
+    print(f"Members: chosen dynamically by Lead; output: provider maximum ({DeepSeekClient.PROVIDER_OUTPUT_CEILING})")
     print(f"Context: budget={context_manager.max_tokens}, trigger={context_manager.trigger_ratio:.0%}, target={context_manager.target_ratio:.0%}")
     print(f"Workspace: {WORKDIR}")
     print("输入需求并回车发送，q 退出。团队事件会自动唤醒 Lead。\n")
