@@ -1,19 +1,18 @@
 {
-  "version": "0.2.0",
-  "configurations": [
-    {
-      "name": "Game Company: existing Python environment",
-      "type": "debugpy",
-      "request": "launch",
-      "python": "D:\\project\\learn-claude-code\\.venv\\Scripts\\python.exe",
-      "program": "${workspaceFolder}/main.py",
-      "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal",
-      "args": [
-        "--env-file",
-        "${workspaceFolder}/.env"
-      ],
-      "justMyCode": true
-    }
-  ]
+    "version":  "0.2.0",
+    "configurations":  [
+                           {
+                               "name":  "Multi-Agent Team: selected Python interpreter",
+                               "type":  "debugpy",
+                               "request":  "launch",
+                               "program":  "${workspaceFolder}/main.py",
+                               "cwd":  "${workspaceFolder}",
+                               "console":  "integratedTerminal",
+                               "args":  [
+                                            "--env-file",
+                                            "${workspaceFolder}/.env"
+                                        ],
+                               "justMyCode":  true
+                           }
+                       ]
 }
