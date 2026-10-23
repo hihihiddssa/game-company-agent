@@ -1,18 +1,14 @@
 {
-    "version":  "0.2.0",
-    "configurations":  [
-                           {
-                               "name":  "Multi-Agent Team Framework: selected Python interpreter",
-                               "type":  "debugpy",
-                               "request":  "launch",
-                               "program":  "${workspaceFolder}/main.py",
-                               "cwd":  "${workspaceFolder}",
-                               "console":  "integratedTerminal",
-                               "args":  [
-                                            "--env-file",
-                                            "${workspaceFolder}/.env"
-                                        ],
-                               "justMyCode":  true
-                           }
-                       ]
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Multi-Agent Team Framework: selected Python interpreter",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
 }

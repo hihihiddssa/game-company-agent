@@ -1,3 +1,4 @@
-# 复用 learn-claude-code 的 SDK，实际请求 DeepSeek 官方兼容接口。
+# Anthropic-compatible model interface, .env loading, and YAML skill/memory metadata.
 anthropic>=0.25.0
 python-dotenv>=1.0.0
+PyYAML>=6.0

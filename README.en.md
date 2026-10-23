@@ -2,24 +2,30 @@
 
 [简体中文](README.md) | **English**
 
-A small Python multi-agent framework built around learn-claude-code-style agent loops. **The entire implementation lives in `main.py`**, with detailed Chinese comments and 16 foldable sections for reading and experimentation.
+A Python agent project built around an integrated learn-claude-code-style runtime: **model → tool calls → tool results → next model turn**. Tasks, teams, memory, skills, background shell work and scheduling live in a single `main.py`.
 
-A Lead agent can finish a task directly or create teammates as needed, choosing their names, roles and assignments at runtime. There is no preset roster or external team configuration JSON.
+The current host follows the s15 integrated structure, with the required s09 memory implementation inlined. A clone no longer needs a sibling course checkout.
 
-## What it does
+## Current capabilities
 
-- **Dynamic delegation:** each teammate runs in its own thread with separate messages and a model loop.
-- **Shared tasks:** file-backed creation, dependencies, assignment, claiming and completion coordinated with file locks.
-- **Messaging:** a JSONL MessageBus with thread notifications for results, approval and shutdown protocols.
-- **Tools:** files, shell commands, task and team operations, with optional teammate tool restrictions.
-- **Context compaction:** request-budget estimation, trimming of older tool output and rolling summaries when needed.
-- **Coordination controls:** optional plan approval, Git worktrees, artifact checks and quality reports.
+| Module | Implemented behavior |
+| --- | --- |
+| Agent loop | Rebuilds the system prompt and tool pool, executes tools and feeds back results |
+| Tasks and teams | File-backed dependencies, claiming and completion; persistent teammates, messages, approval and shutdown protocols |
+| Focused subagent | The `task` tool completes a focused assignment and returns a final summary |
+| Persistent memory | Markdown records with YAML metadata, an index, recall, extraction and consolidation |
+| Skills | Discovers `skills/<directory>/SKILL.md`; exposes a catalog and loads full content on demand |
+| Context handling | Persists large output, trims results, archives history, summarizes and recovers from oversized prompts |
+| Background work | Runs `bash(run_in_background=true)` in a thread and returns notifications |
+| Cron | Five-field schedules, one-shot/recurring jobs and durable records; requires the process to be running |
+| Recovery | Bounded backoff, 429/529 handling, optional fallback model and output escalation/continuation |
+| Teaching MCP interface | **Only in-process `docs` / `deploy` mocks**, demonstrating discovery, namespacing and host authorization |
 
-Persistent memory and MCP are not implemented. The current client uses DeepSeek through an Anthropic-compatible messages interface and the Anthropic Python SDK.
+There is no real remote or stdio MCP transport yet. Mock deployment tools do not deploy a service.
 
-## Quick start
+## Setup and startup
 
-Requires Python 3.10+ and a working DeepSeek API key with available quota. Activate your preferred Python environment first; the project neither selects a hardcoded interpreter nor switches environments automatically.
+Requires Python 3.10+. Activate your preferred environment; no interpreter path is hardcoded.
 
 Windows PowerShell:
 
@@ -30,137 +36,128 @@ python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-Set your local `.env` values:
+Dependencies are `anthropic`, `python-dotenv` and `PyYAML`. For DeepSeek, edit `.env`:
 
 ```dotenv
 DEEPSEEK_API_KEY=your_deepseek_api_key
 MODEL_ID=deepseek-flash
 ```
 
+When only `DEEPSEEK_API_KEY` is set, the program selects `https://api.deepseek.com/anthropic`. Alternatively, configure an Anthropic-compatible endpoint:
+
+```dotenv
+ANTHROPIC_API_KEY=your_api_key
+ANTHROPIC_BASE_URL=https://your-provider.example/anthropic
+MODEL_ID=your_supported_model
+# Optional; must be supported by the same endpoint:
+# FALLBACK_MODEL_ID=your_fallback_model
+```
+
+`ANTHROPIC_API_KEY` takes precedence when both keys are set. For Anthropic's official service, omit the base URL and choose a supported model. This revision uses SDK request parameters directly; the previous wrapper that forced thinking off is no longer present.
+
 ```powershell
-# Check startup settings after filling in .env; sends no API request
-python main.py --check-config
-
-# Start the interactive session; use q / exit or Ctrl+C to leave
 python main.py
-
-# Keep a new task's output separate
-python main.py --workdir workspace/counter-demo
 ```
 
-Model requests go to `https://api.deepseek.com/anthropic`. `--check-api` accesses the model list to verify access without generating text. The real `.env`, generated workspace and caches are ignored by Git.
+Enter a task at `team >>`. Use `q`, `exit` or an empty line to quit. In VS Code, select your environment with **Python: Select Interpreter**.
 
-In VS Code, use **Python: Select Interpreter** to select an environment with the dependencies installed. Run `python -c "import sys; print(sys.executable)"` to inspect your terminal's interpreter. An application `.env` file is separate from a Python virtual environment.
+**The current working directory is the workspace.** To isolate a run:
 
-## How the loops work
-
-```text
-User message or team event
-  → append to Lead messages
-  → check/compact context
-  → request the model with SYSTEM, messages and TOOLS
-  → tool_use? execute tools and append tool_result, then request again
-  → no tool_use? finish this turn and wait for input or team events
+```powershell
+New-Item -ItemType Directory -Force workspace/demo | Out-Null
+Set-Location workspace/demo
+python ../../main.py
 ```
 
-Tool calls in one model response execute sequentially. Teammate threads can run concurrently. Finishing a reply does not terminate the program or shut down teammates.
+The script still loads the project's `.env`; task, memory, skill and output paths follow the working directory. The old `--workdir`, `--env-file`, `--check-config` and `--check-api` arguments are not provided by this revision.
 
-For tracked delegation:
+## Loop and collaboration
 
 ```text
-create_task → update_task dependencies if needed
-            → assign_task(task_id, chosen_name)
+User input / scheduled work / team events / background results
+  → inject messages
+  → prepare context
+  → recall memory and refresh skills, MCP and team context
+  → assemble system prompt and tool pool
+  → call the model with recovery
+  → execute tool_use and append tool_result
+  → repeat; extract persistent memories and finish when no tool calls remain
+```
+
+An asynchronous event loop triggers Lead turns for background events, coordinated with user turns through a lock. Ordinary tool calls in one response run sequentially; background commands and persistent teammates can run in separate threads.
+
+The current team prompt requires **proposing a small team and waiting for user confirmation before spawning persistent teammates**. This is a prompt rule, not a separate confirmation state machine. No roster is predefined. Typical task setup:
+
+```text
+create_task → runtime-generated IDs → update_task dependencies
             → spawn_teammate(name, role, prompt, task_id)
 ```
 
-Spawning with an initial task automatically claims it when assignment and dependencies permit. Do not claim it again. Omit the spawn `task_id` for blocked tasks; an idle teammate scans for ready tasks assigned to its name. Teammates must claim a task before using workspace tools.
+Spawning claims a ready initial task automatically; teammates can also claim ready work from the board. The previous `assign_task`, `accept_delivery` and `Task.assignee` interfaces are absent. Task completion, final replies and thread shutdown remain separate events; Lead uses `request_shutdown` to coordinate exit.
 
-Each teammate has a similar loop and reports through MessageBus. `complete_task` updates task state; it does not immediately terminate the loop or thread. The teammate reports its result and becomes idle, waiting for messages or ready work. Lead uses `request_shutdown` to ask it to exit.
+## Tool pool
 
-## Tools and source navigation
+`BUILTIN_TOOLS` declares schemas and `BUILTIN_HANDLERS` maps functions. `assemble_tool_pool()` merges connected mock MCP tools on every turn. The loop handles `compact` specially.
 
-| Object | Purpose |
+| Category | Tools |
 | --- | --- |
-| `BASE_TOOLS` | `bash`, `read_file`, `write_file`, `edit_file`, `glob` |
-| `TASK_TOOLS` | Task creation, dependencies, list/get, claim, completion and assignment |
-| `TEAM_TOOLS` | Dynamic teammates, member list, messages, plan approval, shutdown and worktrees |
-| `DELIVERY_TOOLS` | `accept_delivery` checks artifacts, existing tasks and an optional report |
-| `TOOLS` | The four groups combined for the Lead model |
-| `TOOL_HANDLERS` | Tool-name-to-Python-function execution mapping |
-| `TEAMMATE_TOOLS` | A restricted teammate set including `submit_plan`, filtered by member permissions |
+| Files and shell | `bash`, `read_file`, `write_file`, `edit_file`, `glob` |
+| Session helpers | `todo_write`, `task`, `load_skill`, `compact` |
+| Tasks | `create_task`, `update_task`, `list_tasks`, `get_task`, `claim_task`, `complete_task` |
+| Persistent teams | `spawn_teammate`, `list_teammates`, `send_message`, `request_shutdown`, `request_plan`, `review_plan` |
+| Scheduling and directories | `schedule_cron`, `list_crons`, `cancel_cron`, `create_worktree` |
+| Mock MCP | `connect_mcp`, then namespaced `mcp__docs__*` / `mcp__deploy__*` tools |
 
-Teammates cannot create agents, create tasks or accept delivery. Their definitions reuse some Lead definitions, so `TEAMMATE_TOOLS` is not appended to `TOOLS` again.
+The focused `task` subagent gets five basic tools. Persistent teammates have their own tool set inside their creation logic.
 
-Start reading `main()` → `agent_loop()` → `execute_tool()` → `TOOL_HANDLERS` → `run_*()`, then inspect `TeammateRuntime.work()` and `spawn_teammate_thread()`.
+Shell calls on the main thread ask `Allow? [y/N]`. Asynchronous turns cannot ask interactive questions and reject shell or MCP operations requiring confirmation. Shell calls have a 120-second timeout and use CMD syntax on Windows. These checks and a working directory are not an OS sandbox.
 
-Useful sections: 04 prompts/settings, 05 tasks, 08 messaging/protocols, 10 tool implementations, 11 teammate lifecycle, 12 schemas/handlers/dispatch, and 15 the Lead loop. The file header contains the full map; VS Code folds `# region` sections. [SOURCE_MAP.md](SOURCE_MAP.md) maps the implementation to the original teaching code.
+## Bundled Skills, Memory and MCP
 
-## Change behavior and permissions
+The four course skills (`agent-builder`, `code-review`, `mcp-builder`, `pdf`) are included, together with the agent-builder reference files and initialization script. Full skill text is loaded on demand; the returned directory identifies the base for relative file references. Restart after editing skills. Optional tools shown inside skills need their own dependencies.
 
-Edit section 04 of `main.py`, then restart:
+Memory from s09 is embedded in `main.py` and wired into recall, extraction and consolidation. MCP keeps the local s15 mocks and tool-pool integration. See [the integration guide](docs/EXTENSIONS.md) for data flow, examples and the boundary between demonstrations and real services. Runtime state and personal memories from the course are not copied.
 
-| Setting | Purpose |
+## Memory, context and usage
+
+The memory index is `.memory/MEMORY.md`; record types are user, feedback, project and reference. Recall selects relevant records and can fall back to keyword matching when model selection fails. Turn completion attempts durable extraction, rejects temporary/duplicate records and can consolidate records after a threshold. These steps can make additional paid model calls; they are not a free cache.
+
+Current parameters are constants near the top of `main.py`:
+
+| Constant | Current value / purpose |
 | --- | --- |
-| `TEAM_NAME` | Display name |
-| `LEAD_PROMPT` | Lead behavior, scope and delegation guidance |
-| `TEAMMATE_PROMPT` | Shared teammate guidance; role/prompt at spawn time defines the actual assignment |
-| `TEAMMATE_ALLOWED_TOOLS` | Upper bound for teammate workspace tools |
-| `DELIVERY_REQUIRED_FILES` | Optional required artifacts; defaults to `[]` |
-| `QUALITY_REPORT_PATH` | Optional quality report path; defaults to `None` |
+| `DEFAULT_MAX_TOKENS` | `8000`, normal output allowance |
+| `ESCALATED_MAX_TOKENS` | `16000`, retry allowance after truncation |
+| `MAX_RETRIES` | `3`, error retry attempts |
+| `MAX_RECOVERY_RETRIES` | `2`, truncation continuation recoveries |
+| `CONTEXT_LIMIT` | `50000`, estimated serialized message length, **not exact tokens** |
+| `KEEP_RECENT_TOOL_RESULTS` | `3`, recent results retained |
+| `PERSIST_THRESHOLD` | `30000`, large output persistence threshold |
 
-The spawn `tools` argument can narrow permissions, never exceed the upper bound. `tools=[]` retains task, messaging and plan tools. This upper bound does not restrict Lead tools. The default prompts encourage minimal work and direct completion of simple tasks; no fixed planner/developer/tester workflow is required.
+These docs reflect the 8000/16000 settings in the new code. The old `AGENT_MAX_OUTPUT_TOKENS` and `CONTEXT_*` environment settings no longer control these constants. Bounded retries and continuation recoveries are not a hard limit on an entire task's model calls or cost.
 
-`accept_delivery` requires at least one real artifact. No teammate or task needs to be created, but any existing tasks must all be complete. When a quality report is required, it must reference a completed task owned by the actual checker, include `passed: true`, an empty `issues` list and successful command `checks`. The checker may be Lead or a dynamic teammate.
+Large output goes to `.task_outputs/tool-results/`; archived history goes to `.transcripts/`. Context may be summarized or recovered after a prompt-too-long error, keeping the active request authoritative and summaries as reference state.
 
-## Context and token usage
-
-Configure these in `.env`; defaults:
-
-| Variable | Default |
-| --- | --- |
-| `CONTEXT_OUTPUT_RESERVE` | `4096` |
-| `CONTEXT_COMPRESSION_ENABLED` | `true` |
-| `CONTEXT_MAX_TOKENS` | `48000` |
-| `CONTEXT_TRIGGER_RATIO` | `0.8` |
-| `CONTEXT_TARGET_RATIO` | `0.55` |
-| `CONTEXT_KEEP_RECENT` | `8` |
-| `CONTEXT_KEEP_TOOL_RESULTS` | `3` |
-| `CONTEXT_SUMMARY_TOKENS` | `2000` |
-| `CONTEXT_TOOL_RESULT_CHARS` | `2400` |
-
-Normal Lead/teammate requests no longer have a low application output cap. The SDK requires `max_tokens`, so the client supplies [DeepSeek's current provider maximum](https://api-docs.deepseek.com/quick_start/pricing/): 384K (393216 tokens). This is not unlimited output and does not require the model to fill the allowance. The old `AGENT_MAX_OUTPUT_TOKENS` setting is ignored.
-
-`CONTEXT_OUTPUT_RESERVE` is only a compaction estimate; **it does not cap actual output**. The summary-only `CONTEXT_SUMMARY_TOKENS` remains to keep handoff summaries concise. The budget includes system text, tool schemas, history, output reservation and protocol allowance. It is estimated from UTF-8 bytes, not an exact provider token count. Older tool output is trimmed first; model-generated rolling summaries are used if needed. Recent messages and complete tool-call/result pairs are preserved. Summaries stay in the owning agent's current process; failure leaves the original history intact.
-
-The terminal logs each model request's duration, input, cache-read and output usage. Compaction limits request history size, **not total task tokens or the number of model requests**. Summarization also consumes API quota.
-
-## Small collaboration exercise
-
-After starting the program, send:
-
-> Create two teammates to build a single-file index.html counter in collab-test/ under the workspace, with increment, decrement and reset buttons; one implements it and one independently reviews it, using task dependencies and assignment tools, send_message for the review result, artifact acceptance and teammate shutdown when done; do not install dependencies, add documentation or test frameworks, or poll status, and finish with the artifact location and actual inspection results.
-
-Paths are relative to the selected workspace. If no browser was opened, the agents should not claim browser testing took place. The default prompts request Chinese responses; change the language guidance in `LEAD_PROMPT` for English conversations.
-
-## Files, limits and next steps
+## Runtime files and navigation
 
 ```text
-main.py          # Entire implementation, 16 foldable sections and Chinese comments
-README.md        # Chinese documentation
-README.en.md     # English documentation
-SOURCE_MAP.md    # Mapping to the teaching code
-.env.example     # Environment variable template
-workspace/       # Created as needed; not committed
-  .tasks/        # JSON task records
-  .mailboxes/    # JSONL inboxes
-  delivery.json  # Delivery record
+main.py                 # Integrated host with inlined memory
+README.md / README.en.md
+SOURCE_MAP.md           # Current function/module locations
+requirements.txt
+.env.example
+skills/<name>/SKILL.md  # Four bundled course skills; scanned in the workspace
+.memory/               # Persistent records and index
+.tasks/ / .mailboxes/   # Task board and inboxes
+.task_outputs/         # Large tool output
+.transcripts/          # History archives
+.scheduled_tasks.json  # Durable schedule records
 ```
 
-- A working directory is not an OS sandbox. Shell access can run other commands. On Windows, the `bash` tool uses CMD syntax.
-- Tasks and inboxes are persisted; chat history, summaries and teammate threads do not resume automatically after restart. Use separate workspaces for fresh tasks.
-- Delivery checks validate files and report structure; they do not prove that reported commands ran or guarantee artifact quality.
-- Persistent memory, MCP and hard per-task request/token budgets remain unimplemented.
+Runtime state, secrets and caches are ignored by Git. Chat history and live threads do not resume as a complete session; persistent memory and durable jobs are separate recovery mechanisms. Scheduled work still requires the Python process, and mock MCP is not a production integration.
+
+Read `agent_loop()` → `call_llm()` → `assemble_system_prompt()` / `assemble_tool_pool()`, then memory, `start_background_task()`, `spawn_teammate_thread()` and the scheduler. See [SOURCE_MAP.md](SOURCE_MAP.md) for exact positions.
 
 ## Attribution and license
 
-Adapted from the **learn-claude-code s13** tool loops and team structure, with compaction ideas from s08. The original MIT license and copyright notice are preserved in [LICENSE](LICENSE).
+The host is based on **learn-claude-code s15 Integrated Harness**, with memory from s09. Original comments and MIT copyright notices are retained; see [LICENSE](LICENSE).

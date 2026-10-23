@@ -2,26 +2,32 @@
 
 **简体中文** | [English](README.en.md)
 
-一个便于阅读、修改和实验的 Python 多 Agent 框架，沿用 learn-claude-code 风格的 Agent Loop。**全部实现放在带详细中文注释的 `main.py` 中**，通过 16 个可折叠分区区分模块。
+基于 learn-claude-code 综合运行框架思路的 Python Agent 项目。核心仍是 **模型 → 工具调用 → 工具结果 → 下一轮模型**，将任务、团队、记忆、技能、后台命令和调度整合在同一个 `main.py` 中。
 
-用户提出目标，Lead 可以直接使用工具完成工作，也可以按需创建子 Agent，自行决定人数、名字和职责。没有预设岗位，也不需要团队配置 JSON。
+当前主程序采用 s15 集成结构，持久记忆实现从 s09 合入。本仓库可以独立运行，不再依赖仓库外的课程目录。
 
-## 已实现的能力
+## 当前能力
 
-- **动态组队**：子 Agent 在独立线程中运行，各自拥有消息历史与模型循环。
-- **共享任务板**：创建任务、建立依赖、派发、认领和完成，使用文件锁协调状态。
-- **消息协作**：MessageBus 使用 JSONL 邮箱与线程通知传递任务反馈、审批和关闭请求。
-- **工具执行**：文件读写、Shell、任务与团队操作；子 Agent 可进一步限制工作区工具。
-- **上下文压缩**：请求前估算预算，缩短旧工具结果，必要时生成滚动摘要。
-- **协作控制**：可选计划审批、Git worktree、产物及可选质量报告检查。
+| 模块 | 实际行为 |
+| --- | --- |
+| Agent Loop | 动态组装系统提示词和工具池，执行工具并回填结果 |
+| 任务与团队 | 文件任务板、依赖、认领与完成；支持常驻 teammate 和消息、计划审批、关闭协议 |
+| 一次性子 Agent | `task` 工具执行聚焦任务，只返回最终摘要；与常驻 teammate 不同 |
+| 持久 Memory | `.memory/` 中保存 YAML 元数据的 Markdown 记录，支持索引、召回、提取与合并 |
+| Skills | 扫描 `skills/<目录>/SKILL.md`，先提供目录，再按需加载全文 |
+| 上下文整理 | 大输出落盘、工具结果裁剪、旧消息归档、模型摘要与超长输入恢复 |
+| 后台命令 | `bash(run_in_background=true)` 在线程中执行，结果以通知回传 |
+| Cron | 五字段表达式、单次/重复任务、可持久化调度；需要本进程运行 |
+| 重试恢复 | 限次退避、429/529 处理、可选备用模型、截断后的升级与续写 |
+| MCP 教学接口 | **仅内置 `docs` / `deploy` 进程内模拟服务**，演示工具发现、名称空间与宿主权限策略 |
 
-持久 Memory 和 MCP 尚未实现。当前模型客户端使用 DeepSeek，通过 Anthropic SDK 调用兼容消息接口。
+MCP 部分尚未实现连接真实远端或 stdio 服务的传输层；模拟部署工具不会实际部署服务。
 
-## 快速开始
+## 安装与启动
 
-需要 Python 3.10+，以及可用的 DeepSeek API 密钥和额度。先激活你自己选择的 Python 环境；项目不会指定解释器路径或自动切换环境。
+需要 Python 3.10+。先激活你自己选择的 Python 环境；项目不固定解释器路径。
 
-下面使用 Windows PowerShell：
+Windows PowerShell：
 
 ```powershell
 git clone https://github.com/hihihiddssa/multi-agent-team-framework.git
@@ -30,144 +36,128 @@ python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-在本地 `.env` 中填写密钥和模型：
+依赖包括 `anthropic`、`python-dotenv` 和 `PyYAML`。编辑 `.env`，例如使用 DeepSeek：
 
 ```dotenv
 DEEPSEEK_API_KEY=your_deepseek_api_key
 MODEL_ID=deepseek-flash
 ```
 
+只配置 `DEEPSEEK_API_KEY` 时，程序自动使用 `https://api.deepseek.com/anthropic`。也可以用其他 Anthropic 兼容端点：
+
+```dotenv
+ANTHROPIC_API_KEY=your_api_key
+ANTHROPIC_BASE_URL=https://your-provider.example/anthropic
+MODEL_ID=your_supported_model
+# 可选：必须是同一端点支持的模型
+# FALLBACK_MODEL_ID=your_fallback_model
+```
+
+两种密钥同时存在时，`ANTHROPIC_API_KEY` 优先。使用 Anthropic 官方服务时可省略 `ANTHROPIC_BASE_URL`，并设置它支持的模型名称。当前直接使用 SDK 参数，未沿用旧版强制关闭思考模式的包装器。
+
 ```powershell
-# 填写环境变量后检查启动参数，不发送 API 请求
-python main.py --check-config
-
-# 启动交互；输入 q / exit 或 Ctrl+C 退出
 python main.py
-
-# 为新任务使用独立产物目录
-python main.py --workdir workspace/counter-demo
 ```
 
-实际模型请求发往 `https://api.deepseek.com/anthropic`。`--check-api` 会访问模型列表验证接口；不会生成文本。真实 `.env`、运行产物和缓存均被 Git 忽略。
+出现 `team >>` 后输入任务。输入 `q`、`exit` 或空行退出。在 VS Code 中使用 **Python: Select Interpreter** 选择环境。
 
-在 VS Code 中，通过 **Python: Select Interpreter** 选择已安装依赖的环境。可运行 `python -c "import sys; print(sys.executable)"` 确认终端解释器；`.env` 与 Python 虚拟环境是两回事。
+**当前工作目录就是工作区。** 希望把产物隔离到子目录时：
 
-## 运行流程
-
-```mermaid
-flowchart TD
-    Input[用户消息或团队事件] --> Lead[Lead Agent Loop]
-    Lead --> Model[检查上下文预算并请求模型]
-    Model --> Decision{有工具调用?}
-    Decision -->|有| Tools[权限检查和工具执行]
-    Tools --> Results[tool_result 加入 messages]
-    Results --> Model
-    Decision -->|无| Reply[结束本轮并等待新消息]
-    Tools -->|按需创建| Child[子 Agent 独立循环]
-    Child <--> Tasks[共享 TaskStore]
-    Lead <--> Tasks
-    Child --> Bus[MessageBus]
-    Bus --> Input
+```powershell
+New-Item -ItemType Directory -Force workspace/demo | Out-Null
+Set-Location workspace/demo
+python ../../main.py
 ```
 
-同一条模型回复中的工具调用目前按顺序执行；子 Agent 线程可以并发工作。结束一轮回复不会退出程序或关闭子 Agent。
+程序仍从脚本所在项目的 `.env` 加载配置；任务、记忆、Skills 与输出位置根据当前工作目录决定。本版本不提供旧版的 `--workdir`、`--env-file`、`--check-config` 或 `--check-api` 参数。
 
-需要跟踪委派任务时，通常使用：
+## 循环与协作
 
 ```text
-create_task → 必要的 update_task 依赖
-            → assign_task(task_id, 自选成员名)
+用户输入 / 调度触发 / 团队反馈 / 后台结果
+  → 注入当前消息
+  → 整理上下文
+  → 召回 Memory，刷新 Skills / MCP / 成员信息
+  → 组装 system 和工具池
+  → 请求模型（含恢复策略）
+  → 执行 tool_use，回填 tool_result
+  → 继续循环；无工具调用时提取长期记忆并结束本轮
+```
+
+后台事件通过异步事件循环触发 Lead 回合，使用锁与用户回合协调。单条模型回复中的普通工具调用顺序执行，后台命令和 teammate 可在独立线程中工作。
+
+本版 `PROMPT_SECTIONS["teams"]` 要求 **先提出小团队方案并等待用户确认，再创建常驻成员**。这是提示词规则，不是额外的代码确认状态机。没有固定成员名单。任务关系通常为：
+
+```text
+create_task → 返回真实 ID → update_task 设置必要依赖
             → spawn_teammate(name, role, prompt, task_id)
 ```
 
-创建时会自动认领已派发、依赖就绪的初始任务，不需要子 Agent 重复 claim。依赖未就绪时省略 spawn 的 `task_id`，成员空闲后会自动领取派发给自己的就绪任务。子 Agent 使用文件和 Shell 工具前必须认领任务。
+初始任务在创建成员时自动认领；成员也可以从任务板领取就绪任务。本版没有旧的 `assign_task` / `accept_delivery` 工具，代码也不再使用 `Task.assignee`。任务完成、最终回复、线程退出是不同事件，Lead 通过 `request_shutdown` 协调关闭。
 
-`complete_task` 只更新任务状态，随后仍会进入模型循环处理结果；成员最终报告结果后进入空闲状态，等待消息或新任务。Lead 通过 `request_shutdown` 请求它退出。
+## 工具池
 
-## 工具与阅读入口
+`BUILTIN_TOOLS` 声明参数，`BUILTIN_HANDLERS` 映射 Python 函数；每轮由 `assemble_tool_pool()` 合并已连接的模拟 MCP 工具。`compact` 由主循环单独处理。
 
-| 对象 | 用途 |
+| 类别 | 工具 |
 | --- | --- |
-| `BASE_TOOLS` | `bash`、`read_file`、`write_file`、`edit_file`、`glob` |
-| `TASK_TOOLS` | 创建、依赖、列表、详情、认领、完成与派发任务 |
-| `TEAM_TOOLS` | 动态创建成员、成员列表、消息、计划审批、关闭和 worktree |
-| `DELIVERY_TOOLS` | `accept_delivery` 检查产物、已有任务和可选质量报告 |
-| `TOOLS` | 上述四组定义合并后的 Lead 工具集合，传给模型 |
-| `TOOL_HANDLERS` | 工具名到 Python 执行函数的映射 |
-| `TEAMMATE_TOOLS` | 子 Agent 专用集合，额外包含 `submit_plan`，再按成员权限筛选 |
+| 文件与命令 | `bash`、`read_file`、`write_file`、`edit_file`、`glob` |
+| 会话辅助 | `todo_write`、`task`、`load_skill`、`compact` |
+| 任务 | `create_task`、`update_task`、`list_tasks`、`get_task`、`claim_task`、`complete_task` |
+| 常驻团队 | `spawn_teammate`、`list_teammates`、`send_message`、`request_shutdown`、`request_plan`、`review_plan` |
+| 调度与目录 | `schedule_cron`、`list_crons`、`cancel_cron`、`create_worktree` |
+| 模拟 MCP | `connect_mcp`，连接后加入 `mcp__docs__*` / `mcp__deploy__*` |
 
-子 Agent 不具备创建成员、创建任务或验收交付的工具。`TEAMMATE_TOOLS` 复用了部分 Lead 工具定义，因此不会再次拼入 `TOOLS`。
+一次性 `task` 子 Agent 只有五种基础工具；常驻 teammate 的工具集合在创建逻辑中单独定义。
 
-建议阅读顺序：`main()` → `agent_loop()` → `execute_tool()` → `TOOL_HANDLERS` → `run_*()`；然后阅读 `TeammateRuntime.work()` 和 `spawn_teammate_thread()`。
+主线程执行 Shell 前会询问 `Allow? [y/N]`；异步回合不能弹出这种交互确认，因此会拒绝需要确认的 Shell 或 MCP 操作。Shell 命令有 120 秒超时，Windows 下使用 CMD 语法。工作区与权限检查不是 OS 沙箱。
 
-常用分区：04 提示词与设置、05 任务板、08 消息与协议、10 工具实现、11 子 Agent 生命周期、12 工具定义与分发、15 Lead 循环。文件顶部有完整目录，VS Code 支持折叠 `# region`。与原教学代码的对应关系见 [SOURCE_MAP.md](SOURCE_MAP.md)。
+## 课程模块与资源
 
-## 修改行为与权限
+已完整带上课程的 `agent-builder`、`code-review`、`mcp-builder`、`pdf` 四个技能，以及 agent-builder 的参考文件和初始化脚本。按需加载时会附带技能目录，便于定位相对引用；修改技能后重启即可。技能文档里的额外工具依赖按需安装。
 
-直接编辑 `main.py` 第 04 节，重启后生效：
+s09 Memory 已内联到 `main.py` 并接入召回、提取、合并；MCP 保留本地 s15 的模拟接口与动态工具池。数据流和测试提示词见 [模块接入说明](docs/EXTENSIONS.md)。没有复制课程中的运行状态或私人记忆记录。
 
-| 设置 | 作用 |
+## 记忆、上下文与用量
+
+Memory 索引位于 `.memory/MEMORY.md`，记录类型包括 user、feedback、project、reference。召回会选择相关记录，模型选择失败时可按关键词降级；回合结束会尝试提取持久信息，过滤临时范围和重复内容，达到阈值时可合并记录。这些步骤可能额外调用模型，并不是免费缓存。
+
+本版主要参数直接定义在 `main.py` 顶部：
+
+| 常量 | 当前值 / 用途 |
 | --- | --- |
-| `TEAM_NAME` | 显示名称 |
-| `LEAD_PROMPT` | Lead 的行为、范围与分工原则 |
-| `TEAMMATE_PROMPT` | 子 Agent 共用约束；具体职责来自创建时的 role/prompt |
-| `TEAMMATE_ALLOWED_TOOLS` | 子 Agent 工作区工具权限上限 |
-| `DELIVERY_REQUIRED_FILES` | 必需产物列表，默认 `[]` |
-| `QUALITY_REPORT_PATH` | 可选质量报告路径，默认 `None` |
+| `DEFAULT_MAX_TOKENS` | `8000`，普通请求输出额度 |
+| `ESCALATED_MAX_TOKENS` | `16000`，截断后的升级额度 |
+| `MAX_RETRIES` | `3`，错误重试次数 |
+| `MAX_RECOVERY_RETRIES` | `2`，截断续写恢复次数 |
+| `CONTEXT_LIMIT` | `50000`，序列化消息的估算长度，**不是精确 Token 数** |
+| `KEEP_RECENT_TOOL_RESULTS` | `3`，保留近期工具结果 |
+| `PERSIST_THRESHOLD` | `30000`，长工具输出落盘阈值 |
 
-创建子 Agent 时的 `tools` 参数只能进一步缩小权限，不能越过上限。`tools=[]` 仍保留任务、消息和计划工具；Lead 工具不受该上限限制。名字、职责和人数由模型决定，默认提示词要求简单任务直接完成、只做最小必要工作。
+本次文档按你新代码中的 8000/16000 配置编写；旧版 `AGENT_MAX_OUTPUT_TOKENS` 和 `CONTEXT_*` 环境变量不再控制这些常量。重试与续写次数限制也不等于整个任务的总调用或费用上限。
 
-`accept_delivery` 至少需要一个真实产物文件，不要求创建子 Agent 或任务；若有任务，必须全部完成。启用质量报告时，报告须引用实际执行者拥有且完成的任务，并包含 `passed: true`、空 `issues` 和成功命令的 `checks`。执行者可以是 Lead 或动态成员。
+大输出保存至 `.task_outputs/tool-results/`，历史归档保存至 `.transcripts/`。上下文还会进入模型摘要或提示过长时的恢复路径；保留当前请求并把摘要作为参考状态。
 
-## 上下文与 Token
-
-在 `.env` 中修改，默认值如下：
-
-| 变量 | 默认值 |
-| --- | --- |
-| `CONTEXT_OUTPUT_RESERVE` | `4096` |
-| `CONTEXT_COMPRESSION_ENABLED` | `true` |
-| `CONTEXT_MAX_TOKENS` | `48000` |
-| `CONTEXT_TRIGGER_RATIO` | `0.8` |
-| `CONTEXT_TARGET_RATIO` | `0.55` |
-| `CONTEXT_KEEP_RECENT` | `8` |
-| `CONTEXT_KEEP_TOOL_RESULTS` | `3` |
-| `CONTEXT_SUMMARY_TOKENS` | `2000` |
-| `CONTEXT_TOOL_RESULT_CHARS` | `2400` |
-
-普通 Lead / 子 Agent 不再设置应用层低输出上限：SDK 必须填写 `max_tokens`，因此客户端使用 [DeepSeek 官方当前最大输出](https://api-docs.deepseek.com/quick_start/pricing/) 384K（393216 tokens）；这不是无限输出，也不要求模型写满。旧 `AGENT_MAX_OUTPUT_TOKENS` 不再生效。
-
-`CONTEXT_OUTPUT_RESERVE` 仅是压缩估算的预留，**不会限制实际输出**；摘要专用的 `CONTEXT_SUMMARY_TOKENS` 仍保留，用于保持交接摘要简短。预算包含 system、工具定义、历史、回复预留与协议余量，按 UTF-8 字节估算，不是服务端精确 Token 数。先缩短旧工具输出，再按需请求模型生成摘要；保留近期消息及完整工具调用/结果配对。摘要只属于各 Agent 当前进程，失败时不替换原历史。
-
-终端会打印每次模型请求的耗时、输入、缓存读取和输出用量。压缩控制的是单次请求的历史大小，**不是整个任务的 Token 或请求次数硬上限**；摘要本身也会消耗 API 额度。
-
-## 小规模协作测试
-
-启动后发送：
-
-> 请创建两个子 Agent 协作，在当前工作区的 collab-test/ 中制作一个单文件 index.html 计数器页面，支持加一、减一和重置；一人实现、一人独立检查，通过任务工具设置依赖并派发任务，检查结果用 send_message 告知 Lead，通过后验收交付并关闭成员，全程不安装依赖、不新增文档或测试框架、不轮询状态，最后简短汇报文件位置和实际检查结果。
-
-路径相对于当前工作区。没有实际打开浏览器时，不应声称做过浏览器测试。
-
-## 文件、限制与后续计划
+## 运行文件与阅读入口
 
 ```text
-main.py          # 全部实现和16个可折叠分区，保留详细中文注释
-README.md        # 中文说明
-README.en.md     # English documentation
-SOURCE_MAP.md    # 教学代码对应关系
-.env.example     # 环境变量模板
-workspace/       # 按需创建，不上传 Git
-  .tasks/        # JSON 任务记录
-  .mailboxes/    # JSONL 邮箱
-  delivery.json  # 交付记录
+main.py                 # 综合运行时，含内联 Memory
+README.md / README.en.md
+SOURCE_MAP.md           # 当前模块与函数位置
+requirements.txt
+.env.example
+skills/<name>/SKILL.md  # 自带课程四个技能，扫描实际工作区
+.memory/               # 持久记忆与索引
+.tasks/ / .mailboxes/   # 任务板与邮箱
+.task_outputs/         # 大工具输出
+.transcripts/          # 历史归档
+.scheduled_tasks.json  # 持久调度记录
 ```
 
-- 工作目录不是 OS 沙箱；允许 Shell 就可以启动其他命令。Windows 的 `bash` 工具实际运行 CMD 语法。
-- 任务与邮箱落盘；聊天历史、摘要和成员线程不会在重启后自动恢复。新任务建议使用独立工作区。
-- 交付检查验证文件和报告结构，不证明报告中的命令实际执行过，也不保证产物质量。
-- 持久 Memory、MCP 和任务级请求/Token 硬预算尚未实现。
+运行状态、密钥和缓存已加入 `.gitignore`。聊天历史、运行线程不会整体自动恢复；持久记忆和耐久调度是独立的恢复机制。长期调度仍依赖 Python 进程运行，模拟 MCP 不等于生产级集成。
+
+建议先读 `agent_loop()` → `call_llm()` → `assemble_system_prompt()` / `assemble_tool_pool()`，再读 Memory、`start_background_task()`、`spawn_teammate_thread()` 与调度器。准确位置见 [SOURCE_MAP.md](SOURCE_MAP.md)。
 
 ## 来源与许可
 
-改编自 **learn-claude-code s13** 的工具循环与团队结构，压缩思路参考 s08；保留原项目 MIT 许可和版权声明，详见 [LICENSE](LICENSE)。
+主程序基于 **learn-claude-code s15 Integrated Harness**，记忆实现来自 s09；保留原有注释和 MIT 版权声明，详见 [LICENSE](LICENSE)。

@@ -12,3 +12,12 @@ runs/
 node_modules/
 
 *.log
+
+# Integrated runtime state lives under the current working directory.
+.memory/
+.tasks/
+.mailboxes/
+.transcripts/
+.task_outputs/
+.scheduled_tasks.*
+.worktrees/

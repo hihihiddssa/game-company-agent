@@ -1,39 +1,44 @@
-# 与 learn-claude-code s13 的对应关系
+# 当前综合运行时阅读导航
 
-继续沿用原版模型工具循环。团队采用动态成员，通用提示词、工具权限上限和交付规则直接写在 main.py；模型供应商为 DeepSeek；DeepSeekClient 复用原版 Anthropic SDK 消息格式并关闭深度思考。
+主程序来自 learn-claude-code s15 的综合结构，记忆存储、召回、提取与合并来自 s09，并已合入 main.py，不依赖仓库外文件。工具定义、函数与状态仍保持显式，用户修改的核心循环和恢复逻辑保留。
 
-| 名称 | 原版行号 | 当前文件位置 | 说明 |
-| --- | --- | --- | --- |
-| `agent_loop` | 2887 | [main.py:3932](main.py#L3932) | 沿用原版执行结构 |
-| `MessageBus` | 1171 | [main.py:1529](main.py#L1529) | 沿用原版执行结构 |
-| `execute_tool` | 2870 | [main.py:3659](main.py#L3659) | 沿用原版执行结构 |
-| `consume_lead_inbox` | 1451 | [main.py:1821](main.py#L1821) | 沿用原版执行结构 |
-| `TeammateRuntime` | 1832 | [main.py:2776](main.py#L2776) | 扩展或修复 |
-| `create_task` | 189 | [main.py:663](main.py#L663) | 沿用原版执行结构 |
-| `update_task` | 227 | [main.py:701](main.py#L701) | 扩展或修复 |
-| `claim_task` | 337 | [main.py:819](main.py#L819) | 扩展或修复 |
-| `complete_task` | 367 | [main.py:857](main.py#L857) | 沿用原版执行结构 |
-| `run_bash` | 977 | [main.py:2145](main.py#L2145) | 扩展或修复 |
-| `DeepSeekClient` | — | [main.py:76](main.py#L76) | 新增 |
-| `ContextManager` | — | [main.py:166](main.py#L166) | 新增：参考 s08 的分层压缩，接入 Lead 与队友 |
-| `teammate_tools` | — | [main.py:2097](main.py#L2097) | 通用团队支持 |
-| `build_prompt_sections` | — | [main.py:1454](main.py#L1454) | 通用团队支持 |
-| `run_assign_task` | — | [main.py:2683](main.py#L2683) | 新增 |
-| `run_accept_delivery` | — | [main.py:2716](main.py#L2716) | 新增 |
-| `main` | — | [main.py:4011](main.py#L4011) | 新增 |
+| 入口 | 当前位置 | 用途 |
+| --- | --- | --- |
+| `agent_loop` | [main.py:3941](main.py#L3941) | 主循环：调度、上下文、模型、工具与恢复 |
+| `call_llm` | [main.py:3919](main.py#L3919) | 动态系统提示词与错误重试 |
+| `assemble_system_prompt` | [main.py:1382](main.py#L1382) | Skills / Memory / MCP 背景组装 |
+| `assemble_tool_pool` | [main.py:3422](main.py#L3422) | 内置工具与模拟 MCP 合并 |
+| `write_memory_file` | [main.py:206](main.py#L206) | 持久记忆文件与索引 |
+| `load_memories` | [main.py:398](main.py#L398) | 相关记忆召回 |
+| `extract_memories` | [main.py:447](main.py#L447) | 回合结束提取持久信息 |
+| `consolidate_memories` | [main.py:524](main.py#L524) | 记忆整理合并 |
+| `scan_skills` | [main.py:1266](main.py#L1266) | 本地 Skill 目录扫描 |
+| `create_task` | [main.py:743](main.py#L743) | 共享任务创建 |
+| `update_task` | [main.py:781](main.py#L781) | 任务依赖维护 |
+| `claim_task` | [main.py:889](main.py#L889) | 认领与目录绑定 |
+| `complete_task` | [main.py:919](main.py#L919) | 任务完成 |
+| `MessageBus` | [main.py:1683](main.py#L1683) | JSONL 邮箱与线程通知 |
+| `spawn_teammate_thread` | [main.py:1946](main.py#L1946) | 常驻成员线程与工作/空闲状态 |
+| `spawn_subagent` | [main.py:2498](main.py#L2498) | 一次性聚焦子 Agent |
+| `start_background_task` | [main.py:2942](main.py#L2942) | 后台 Shell 与结果通知 |
+| `schedule_job` | [main.py:3159](main.py#L3159) | Cron 注册与持久化 |
+| `start_runtime_services` | [main.py:3275](main.py#L3275) | 启动调度服务 |
+| `MCPClient` | [main.py:3305](main.py#L3305) | 进程内模拟工具服务 |
+| `connect_mcp` | [main.py:3407](main.py#L3407) | 模拟发现和连接 |
+| `prepare_context` | [main.py:3842](main.py#L3842) | 多级上下文整理 |
+| `compact_history` | [main.py:2761](main.py#L2761) | 归档与摘要 |
+| `RecoveryState` | [main.py:2800](main.py#L2800) | 重试及输出恢复状态 |
+| `async_event_loop` | [main.py:4162](main.py#L4162) | 后台事件唤醒 Lead |
 
-Shell 经过非交互与进程树超时修复。游戏职责、派发、验收和 DeepSeek 配置是本项目扩展。
-原有中文注释保留；全部 Python 实现位于 main.py，按编号分区，函数位置见上表；根目录不附带框架 tests/。
+与上一版的重要区别：
 
-压缩学习入口：`prepare()` → `_micro_compact()` → `_find_cut()` → `_summarize()`。
+- BUILTIN_TOOLS / BUILTIN_HANDLERS 与动态 assemble_tool_pool 替代旧的分组 TOOLS。
+- 不再有 DeepSeekClient、ContextManager、TeammateRuntime 类，也没有 assign_task / accept_delivery 工具。
+- Memory 已实际接入；MCP 仍是 docs/deploy 的进程内模拟，不包含远端传输。
+- 工作区使用 Path.cwd()；启动入口在文件末尾的 __main__ 分支，不提供旧的 CLI 参数。
+- 输出使用 DEFAULT_MAX_TOKENS=8000、ESCALATED_MAX_TOKENS=16000；上下文使用序列化消息长度估算。
+- .env 使用 Anthropic SDK 配置，并兼容原有 DEEPSEEK_API_KEY 快捷方式。
 
-原 STUDIO_TOOLS 拆为通用 TASK_TOOLS 派发和 DELIVERY_TOOLS 交付；游戏只是用户可以提出的一种工作目标。
+当前目录中的 .memory、.tasks、.mailboxes、.transcripts、.task_outputs 和 .scheduled_tasks.* 是运行状态，不上传 Git。
 
-
-动态成员入口：`spawn_teammate_thread()` 接收模型自选身份，登记运行时 TEAM_MEMBERS，再创建 TeammateRuntime 和线程。不预设成员，也不指定固定成员必须参与交付。Lead 可直接完成任务并交付，无需创建任何子 Agent。
-
-单文件工具入口：第 10 节实现 run_*，第 12 节直接定义分组 Schema、合并 TOOLS、建立 TOOL_HANDLERS 并进行分发；不再使用 initialize_tools 或运行时模块绑定。
-
-直接设置入口：main.py 第 04 节的 TEAM_NAME、LEAD_PROMPT、TEAMMATE_PROMPT、TEAMMATE_ALLOWED_TOOLS、DELIVERY_REQUIRED_FILES 与 QUALITY_REPORT_PATH。外部团队 JSON 加载、校验和切换层已移除。
-
-普通 Agent 输出不再受应用层低上限限制；DeepSeekClient 补齐 SDK 必填的提供方最大输出值。ContextManager.output_reserve 仅用于压缩预算估算，摘要仍使用独立的 summary_tokens。
+课程 Skills 资源位于 `skills/`；模块数据流与测试提示词见 [docs/EXTENSIONS.md](docs/EXTENSIONS.md)。
